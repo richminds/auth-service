@@ -1,0 +1,26 @@
+# Local run of the auth service container.
+#
+#   docker compose up --build
+#   curl localhost:8100/health
+#
+# Reads secrets from .env (never committed). MongoDB is optional — with
+# AUTH_MONGO_URI unset the service falls back to in-memory user/organization
+# storage and everything else works unchanged (no persistence across restarts).
+services:
+  auth-service:
+    build: .
+    image: auth-service:latest
+    container_name: auth-service
+    ports:
+      - "${AUTHSVC_PORT:-8100}:8100"
+    env_file:
+      - .env
+    environment:
+      AUTHSVC_PORT: 8100
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8100/health/live', timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
