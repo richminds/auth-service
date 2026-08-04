@@ -121,6 +121,64 @@ async def test_assign_organization_to_nonexistent_user_raises():
         await service.assign_user_organization("USR-GHOST", org.org_id)
 
 
+async def test_register_with_org_id_joins_that_organization():
+    org = await service.create_organization("Acme", created_by="USR-admin")
+    resp = await service.register(
+        RegisterRequest(email="a@b.com", name="A", password="hunter22", org_id=org.org_id)
+    )
+    assert resp.user.org_id == org.org_id
+
+
+async def test_register_with_unknown_org_id_raises():
+    with pytest.raises(service.OrganizationNotFoundError):
+        await service.register(
+            RegisterRequest(email="a@b.com", name="A", password="hunter22", org_id="ORG-GHOST")
+        )
+
+
+async def test_portless_email_ignores_supplied_org_id(monkeypatch):
+    monkeypatch.setattr(auth_settings, "portless_emails_raw", "admin@portless.io")
+    org = await service.create_organization("Acme", created_by="USR-admin")
+    resp = await service.register(
+        RegisterRequest(
+            email="admin@portless.io", name="Admin", password="hunter22", org_id=org.org_id
+        )
+    )
+    assert resp.user.org_id == "portless"
+
+
+# ─────────────────────────────────────────────── self-service join
+
+
+async def test_join_organization_assigns_a_guest_user():
+    resp = await service.register(RegisterRequest(email="a@b.com", name="A", password="hunter22"))
+    org = await service.create_organization("Acme", created_by="USR-admin")
+    joined = await service.join_organization(resp.user.user_id, org.org_id)
+    assert joined.user.org_id == org.org_id
+
+
+async def test_join_organization_rejects_already_assigned_user():
+    org1 = await service.create_organization("Acme", created_by="USR-admin")
+    org2 = await service.create_organization("Globex", created_by="USR-admin")
+    resp = await service.register(
+        RegisterRequest(email="a@b.com", name="A", password="hunter22", org_id=org1.org_id)
+    )
+    with pytest.raises(service.AlreadyAssignedError):
+        await service.join_organization(resp.user.user_id, org2.org_id)
+
+
+async def test_join_organization_rejects_unknown_org():
+    resp = await service.register(RegisterRequest(email="a@b.com", name="A", password="hunter22"))
+    with pytest.raises(service.OrganizationNotFoundError):
+        await service.join_organization(resp.user.user_id, "ORG-GHOST")
+
+
+async def test_join_organization_rejects_unknown_user():
+    org = await service.create_organization("Acme", created_by="USR-admin")
+    with pytest.raises(service.UserNotFoundError):
+        await service.join_organization("USR-GHOST", org.org_id)
+
+
 async def test_find_or_create_organization_for_deal_creates_once():
     org1 = await service.find_or_create_organization_for_deal("Acme Corp", email="buyer@acme.com")
     org2 = await service.find_or_create_organization_for_deal("acme corp", email="buyer2@acme.com")

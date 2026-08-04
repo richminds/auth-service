@@ -44,6 +44,12 @@ class UserNotFoundError(Exception):
     """Raised when assigning an org to a user_id that doesn't exist (404)."""
 
 
+class AlreadyAssignedError(Exception):
+    """Raised when a user who already belongs to an organization calls the
+    self-service join endpoint (409) — changing an existing assignment stays
+    a staff-only action (see assign_user_organization)."""
+
+
 def _new_user_id() -> str:
     return f"USR-{uuid4().hex[:12].upper()}"
 
@@ -68,11 +74,12 @@ def _token_for(user: UserRecord) -> TokenResponse:
 async def register(req: RegisterRequest) -> TokenResponse:
     """Register a new user.
 
-    No organization is derived from the email — org_id stays unset (None)
-    unless the email is on the AUTH_PORTLESS_EMAILS allowlist, in which case
-    it gets the reserved platform-staff org_id automatically. Everyone else
-    waits for a staff admin to assign them to an organization (see
-    assign_user_organization) before org-scoped endpoints will serve them.
+    A platform-staff email (AUTH_PORTLESS_EMAILS) always gets the reserved
+    staff org_id, regardless of what ``req.org_id`` says. Otherwise, if the
+    caller supplied ``org_id`` it must reference an existing organization —
+    the new account joins it directly. If it's omitted, the account is
+    created as a guest (org_id stays None); it can join an organization later
+    via join_organization (self-service) or assign_user_organization (staff).
     """
     email = req.email.strip().lower()
     if not _EMAIL_RE.match(email):
@@ -82,7 +89,15 @@ async def register(req: RegisterRequest) -> TokenResponse:
     if await repo.get_by_email(email) is not None:
         raise EmailTakenError(f"An account with {email!r} already exists")
 
-    org_id = PORTLESS_ORG_ID if is_portless_user(email) else None
+    if is_portless_user(email):
+        org_id = PORTLESS_ORG_ID
+    elif req.org_id:
+        if await get_org_repository().get(req.org_id) is None:
+            raise OrganizationNotFoundError(f"Organization {req.org_id!r} not found")
+        org_id = req.org_id
+    else:
+        org_id = None
+
     user = UserRecord(
         user_id=_new_user_id(),
         email=email,
@@ -92,7 +107,7 @@ async def register(req: RegisterRequest) -> TokenResponse:
         created_at=datetime.now(timezone.utc),
     )
     await repo.create(user)
-    logger.info("Auth: registered user %s (%s) org=%s", user.user_id, email, org_id or "unassigned")
+    logger.info("Auth: registered user %s (%s) org=%s", user.user_id, email, org_id or "guest")
     return _token_for(user)
 
 
@@ -167,6 +182,39 @@ async def assign_user_organization(user_id: str, org_id: str) -> UserPublic:
 
     logger.info("Auth: user %s assigned to organization %s", user_id, org_id)
     return UserPublic.from_record(updated)
+
+
+async def join_organization(user_id: str, org_id: str) -> TokenResponse:
+    """Self-service: let the caller attach their own (still-guest) account to
+    an organization — for a signup that omitted org_id, or one where the
+    org_id given didn't resolve. Only usable while the account is still a
+    guest (org_id is None); once assigned, changing it is staff-only (see
+    assign_user_organization) so a user can't unilaterally hop between
+    organizations' scoped data.
+
+    Returns a fresh TokenResponse (not just UserPublic) since org_id is baked
+    into the access token's claims — the caller needs a new token to reach
+    org-scoped endpoints without logging in again.
+    """
+    user = await get_repository().get_by_id(user_id)
+    if user is None:
+        raise UserNotFoundError(f"User {user_id!r} not found")
+
+    if user.org_id is not None:
+        raise AlreadyAssignedError(
+            f"User {user_id!r} already belongs to organization {user.org_id!r}; "
+            "contact an administrator to change it"
+        )
+
+    if await get_org_repository().get(org_id) is None:
+        raise OrganizationNotFoundError(f"Organization {org_id!r} not found")
+
+    updated = await get_repository().update_org(user_id, org_id)
+    if updated is None:
+        raise UserNotFoundError(f"User {user_id!r} not found")
+
+    logger.info("Auth: user %s self-joined organization %s", user_id, org_id)
+    return _token_for(updated)
 
 
 async def find_or_create_organization_for_deal(name: str, email: str | None = None) -> OrganizationRecord:

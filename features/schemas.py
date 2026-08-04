@@ -53,6 +53,11 @@ class RegisterRequest(BaseModel):
     email: str = Field(min_length=3, max_length=200)
     name: str = Field(min_length=1, max_length=120)
     password: str = Field(min_length=6, max_length=200)
+    org_id: str | None = Field(default=None, max_length=200)
+    """Optional at signup. If given, must reference an existing organization
+    (see service.register) and the account is created as a member of it.
+    If omitted, the account is created as a guest (org_id stays None) —
+    it can join one later via POST /auth/me/organization."""
 
 
 class LoginRequest(BaseModel):

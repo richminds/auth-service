@@ -113,6 +113,75 @@ def test_logout_requires_a_token(client):
     assert client.post("/auth/logout").status_code == 401
 
 
+# ─────────────────────────────────────────────── organization self-service
+
+
+def test_anyone_can_register_an_organization(client):
+    r = client.post("/auth/organizations/register", json={"name": "Acme"})
+    assert r.status_code == 201, r.text
+    assert r.json()["org_id"]
+    assert r.json()["created_by"] == "self-serve"
+
+
+def test_register_with_org_id_joins_immediately(client):
+    org_id = client.post("/auth/organizations/register", json={"name": "Acme"}).json()["org_id"]
+    r = client.post(
+        "/auth/register",
+        json={"email": "joined@b.com", "name": "A", "password": "hunter22", "org_id": org_id},
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["user"]["org_id"] == org_id
+
+
+def test_register_with_unknown_org_id_is_404(client):
+    r = client.post(
+        "/auth/register",
+        json={"email": "ghost@b.com", "name": "A", "password": "hunter22", "org_id": "ORG-GHOST"},
+    )
+    assert r.status_code == 404
+
+
+def test_guest_can_join_an_organization(client):
+    token, user = register(client, "guest@b.com", "Guest")
+    assert user["org_id"] is None
+
+    org_id = client.post("/auth/organizations/register", json={"name": "Acme"}).json()["org_id"]
+    r = client.post(
+        "/auth/me/organization", json={"org_id": org_id}, headers=auth_headers(token)
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["user"]["org_id"] == org_id
+
+    # the returned token already carries the new org_id claim
+    new_token = r.json()["access_token"]
+    r = client.get("/auth/me", headers=auth_headers(new_token))
+    assert r.json()["org_id"] == org_id
+
+
+def test_already_assigned_user_cannot_self_join_another_org(client):
+    org1 = client.post("/auth/organizations/register", json={"name": "Acme"}).json()["org_id"]
+    org2 = client.post("/auth/organizations/register", json={"name": "Globex"}).json()["org_id"]
+    token, _ = register(client, "assigned@b.com", "A")
+    client.post("/auth/me/organization", json={"org_id": org1}, headers=auth_headers(token))
+
+    r = client.post("/auth/me/organization", json={"org_id": org2}, headers=auth_headers(token))
+    assert r.status_code == 409
+
+
+def test_join_unknown_organization_is_404(client):
+    token, _ = register(client, "joinghost@b.com", "A")
+    r = client.post(
+        "/auth/me/organization", json={"org_id": "ORG-GHOST"}, headers=auth_headers(token)
+    )
+    assert r.status_code == 404
+
+
+def test_join_organization_requires_a_token(client):
+    org_id = client.post("/auth/organizations/register", json={"name": "Acme"}).json()["org_id"]
+    r = client.post("/auth/me/organization", json={"org_id": org_id})
+    assert r.status_code == 401
+
+
 # ─────────────────────────────────────────────── organization admin (platform staff only)
 
 

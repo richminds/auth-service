@@ -9,6 +9,7 @@ framework-free and importable in-process.
     InvalidCredentialsError   → 401  bad email/password at login
     OrganizationNotFoundError → 404  assigning a user to a nonexistent org
     UserNotFoundError         → 404  assigning an org to a nonexistent user
+    AlreadyAssignedError      → 409  self-service join by an already-assigned user
 """
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from features.service import (
+    AlreadyAssignedError,
     EmailTakenError,
     InvalidCredentialsError,
     InvalidEmailError,
@@ -61,3 +63,7 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(UserNotFoundError)
     async def _user_not_found(request: Request, exc: UserNotFoundError) -> JSONResponse:
         return _problem(request, 404, "user_not_found", str(exc))
+
+    @app.exception_handler(AlreadyAssignedError)
+    async def _already_assigned(request: Request, exc: AlreadyAssignedError) -> JSONResponse:
+        return _problem(request, 409, "already_assigned", str(exc))

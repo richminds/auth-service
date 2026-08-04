@@ -64,8 +64,9 @@ class AuthServiceError(Exception):
     """Raised when the auth service returns a non-2xx response.
 
     ``status_code``: 401 bad credentials/invalid or revoked token, 403 not
-    platform staff, 409 email already registered, 422 malformed input, 404
-    organization/user not found.
+    platform staff, 409 email already registered or self-join by an
+    already-assigned user, 422 malformed input, 404 organization/user not
+    found.
     """
 
     def __init__(self, status_code: int, message: str, code: str = "") -> None:
@@ -113,10 +114,16 @@ class AuthServiceClient:
 
     # ------------------------------------------------------------- identity
 
-    async def register(self, email: str, name: str, password: str) -> TokenResponse:
-        r = await self._client.post(
-            "/auth/register", json={"email": email, "name": name, "password": password}
-        )
+    async def register(
+        self, email: str, name: str, password: str, org_id: str | None = None
+    ) -> TokenResponse:
+        """Register a new user. Pass ``org_id`` (from ``register_organization``)
+        to join that organization immediately; omit it to sign up as a guest
+        and join one later via ``join_organization``."""
+        payload: dict[str, Any] = {"email": email, "name": name, "password": password}
+        if org_id is not None:
+            payload["org_id"] = org_id
+        r = await self._client.post("/auth/register", json=payload)
         _raise_for_error(r)
         d = r.json()
         return TokenResponse(access_token=d["access_token"], user=_user_from_dict(d["user"]))
@@ -135,6 +142,29 @@ class AuthServiceClient:
     async def logout(self, token: str) -> None:
         r = await self._client.post("/auth/logout", headers=self._auth_headers(token))
         _raise_for_error(r)
+
+    # ------------------------------------------------ organization self-service
+
+    async def register_organization(self, name: str) -> OrganizationRecord:
+        """Self-serve organization creation — no token required. Returns the
+        new org_id to hand out at signup or pass to ``join_organization``."""
+        r = await self._client.post("/auth/organizations/register", json={"name": name})
+        _raise_for_error(r)
+        return OrganizationRecord(**r.json())
+
+    async def join_organization(self, token: str, org_id: str) -> TokenResponse:
+        """Attach the caller's own (still-guest) account to an organization.
+
+        Only succeeds while the account is unassigned — raises
+        ``AuthServiceError(409)`` once it already belongs to one. Returns a
+        fresh token carrying the new org_id claim.
+        """
+        r = await self._client.post(
+            "/auth/me/organization", json={"org_id": org_id}, headers=self._auth_headers(token)
+        )
+        _raise_for_error(r)
+        d = r.json()
+        return TokenResponse(access_token=d["access_token"], user=_user_from_dict(d["user"]))
 
     # -------------------------------------------------- organization admin
     # Platform-staff only (403 otherwise) — see features/organization.py.

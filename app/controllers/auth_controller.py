@@ -30,6 +30,13 @@ async def auth_health() -> dict[str, str]:
 
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
 async def register(payload: RegisterRequest) -> TokenResponse:
+    """Register a new user.
+
+    ``payload.org_id`` is optional — give it to join that organization
+    immediately (must already exist, see POST /auth/organizations/register).
+    Omit it to sign up as a guest and join one later via
+    POST /auth/me/organization.
+    """
     return await service.register(payload)
 
 
@@ -64,6 +71,42 @@ async def logout(request: Request, user: AuthUser = Depends(get_current_user)) -
     auth_header = request.headers.get("Authorization", "")
     token = auth_header.split(" ", 1)[1].strip() if auth_header.lower().startswith("bearer ") else ""
     await service.logout(token, user.user_id)
+
+
+# ---------------------------------------------------------------------------
+# Organization self-service — no staff gate. Public creation so a new
+# organization can obtain an org_id before anyone has signed up under it;
+# the join endpoint lets a signed-up guest attach themselves to one
+# afterwards, one-way (guest -> assigned), without staff involvement.
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/organizations/register",
+    response_model=OrganizationRecord,
+    status_code=status.HTTP_201_CREATED,
+)
+async def register_organization(payload: CreateOrganizationRequest) -> OrganizationRecord:
+    """Self-serve organization creation — no auth required.
+
+    Returns the new org_id for the caller to hand out to teammates (e.g. in
+    the signup form) or pass to POST /auth/register directly.
+    """
+    return await service.create_organization(payload.name, created_by="self-serve")
+
+
+@router.post("/me/organization", response_model=TokenResponse)
+async def join_my_organization(
+    payload: AssignUserOrgRequest,
+    user: AuthUser = Depends(get_current_user),
+) -> TokenResponse:
+    """Attach the current (guest) user to an organization missed at signup.
+
+    Only works while the account is still unassigned (org_id is None) — once
+    a user belongs to an organization, changing it is staff-only (see
+    PATCH /auth/users/{user_id}/organization) so a user can't unilaterally
+    hop into another organization's scoped data.
+    """
+    return await service.join_organization(user.user_id, payload.org_id)
 
 
 # ---------------------------------------------------------------------------
