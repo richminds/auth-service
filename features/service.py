@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from .blacklist import revoke_token
-from .organization import PORTLESS_ORG_ID, is_portless_user
+from .organization import GUEST_ORG_ID, PORTLESS_ORG_ID, is_portless_user
 from .repository import get_org_repository, get_repository
 from .schemas import (
     LoginRequest,
@@ -77,9 +77,11 @@ async def register(req: RegisterRequest) -> TokenResponse:
     A platform-staff email (AUTH_PORTLESS_EMAILS) always gets the reserved
     staff org_id, regardless of what ``req.org_id`` says. Otherwise, if the
     caller supplied ``org_id`` it must reference an existing organization —
-    the new account joins it directly. If it's omitted, the account is
-    created as a guest (org_id stays None); it can join an organization later
-    via join_organization (self-service) or assign_user_organization (staff).
+    the new account joins it directly. If it's omitted, the account lands in
+    the shared Guest organization (see ensure_guest_organization) instead of
+    staying unassigned; it can move to a real one later via
+    join_organization (self-service, while still on Guest) or
+    assign_user_organization (staff, any time).
     """
     email = req.email.strip().lower()
     if not _EMAIL_RE.match(email):
@@ -96,7 +98,8 @@ async def register(req: RegisterRequest) -> TokenResponse:
             raise OrganizationNotFoundError(f"Organization {req.org_id!r} not found")
         org_id = req.org_id
     else:
-        org_id = None
+        await ensure_guest_organization()
+        org_id = GUEST_ORG_ID
 
     user = UserRecord(
         user_id=_new_user_id(),
@@ -107,8 +110,39 @@ async def register(req: RegisterRequest) -> TokenResponse:
         created_at=datetime.now(timezone.utc),
     )
     await repo.create(user)
-    logger.info("Auth: registered user %s (%s) org=%s", user.user_id, email, org_id or "guest")
+    logger.info("Auth: registered user %s (%s) org=%s", user.user_id, email, org_id)
     return _token_for(user)
+
+
+async def ensure_guest_organization() -> OrganizationRecord:
+    """Idempotently ensure the shared Guest organization exists.
+
+    Called on every guest signup (register() with no org_id) and, best
+    effort, at service startup — either way it's a single lookup once the
+    record exists. Handles losing a create race against a concurrent caller
+    (e.g. two guest signups on a cold start) by re-fetching instead of
+    surfacing a spurious 500.
+    """
+    org_repo = get_org_repository()
+    existing = await org_repo.get(GUEST_ORG_ID)
+    if existing is not None:
+        return existing
+
+    org = OrganizationRecord(
+        org_id=GUEST_ORG_ID,
+        name=GUEST_ORG_ID,
+        created_by="system:bootstrap",
+        created_at=datetime.now(timezone.utc),
+    )
+    try:
+        await org_repo.create(org)
+    except Exception:  # noqa: BLE001 — lost a create race; the winner is fine to use
+        winner = await org_repo.get(GUEST_ORG_ID)
+        if winner is not None:
+            return winner
+        raise
+    logger.info("Auth: bootstrapped the shared Guest organization (org_id=%s)", GUEST_ORG_ID)
+    return org
 
 
 async def login(req: LoginRequest) -> TokenResponse:
@@ -185,12 +219,13 @@ async def assign_user_organization(user_id: str, org_id: str) -> UserPublic:
 
 
 async def join_organization(user_id: str, org_id: str) -> TokenResponse:
-    """Self-service: let the caller attach their own (still-guest) account to
-    an organization — for a signup that omitted org_id, or one where the
-    org_id given didn't resolve. Only usable while the account is still a
-    guest (org_id is None); once assigned, changing it is staff-only (see
-    assign_user_organization) so a user can't unilaterally hop between
-    organizations' scoped data.
+    """Self-service: let the caller attach their own account to a real
+    organization — for a signup that landed on the shared Guest org (the
+    register() default) or, for an older record, was never assigned at all.
+    Only usable while the account is still on Guest or unassigned (org_id is
+    GUEST_ORG_ID or None); once on a real organization, changing it is
+    staff-only (see assign_user_organization) so a user can't unilaterally
+    hop between organizations' scoped data.
 
     Returns a fresh TokenResponse (not just UserPublic) since org_id is baked
     into the access token's claims — the caller needs a new token to reach
@@ -200,7 +235,7 @@ async def join_organization(user_id: str, org_id: str) -> TokenResponse:
     if user is None:
         raise UserNotFoundError(f"User {user_id!r} not found")
 
-    if user.org_id is not None:
+    if user.org_id is not None and user.org_id != GUEST_ORG_ID:
         raise AlreadyAssignedError(
             f"User {user_id!r} already belongs to organization {user.org_id!r}; "
             "contact an administrator to change it"

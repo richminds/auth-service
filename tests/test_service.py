@@ -28,7 +28,23 @@ async def test_register_returns_a_token_and_user():
     resp = await service.register(RegisterRequest(email="a@b.com", name="A B", password="hunter22"))
     assert resp.access_token
     assert resp.user.email == "a@b.com"
-    assert resp.user.org_id is None  # unassigned until a staff admin assigns one
+    assert resp.user.org_id == service.GUEST_ORG_ID  # lands on the shared Guest org by default
+
+
+async def test_register_bootstraps_the_guest_organization():
+    resp = await service.register(RegisterRequest(email="a@b.com", name="A", password="hunter22"))
+    orgs = await service.list_organizations()
+    guest = next(o for o in orgs if o.org_id == service.GUEST_ORG_ID)
+    assert guest.name == service.GUEST_ORG_ID
+    assert resp.user.org_id == guest.org_id
+
+
+async def test_register_reuses_the_same_guest_organization_for_every_guest():
+    resp1 = await service.register(RegisterRequest(email="a@b.com", name="A", password="hunter22"))
+    resp2 = await service.register(RegisterRequest(email="c@d.com", name="C", password="hunter22"))
+    assert resp1.user.org_id == resp2.user.org_id == service.GUEST_ORG_ID
+    orgs = await service.list_organizations()
+    assert len([o for o in orgs if o.org_id == service.GUEST_ORG_ID]) == 1
 
 
 async def test_register_lowercases_and_strips_email():

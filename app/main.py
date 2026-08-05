@@ -23,6 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from features import __version__
 from features.config import auth_settings
 from features.repository import close_repository, init_repository
+from features.service import ensure_guest_organization
 
 from .config import service_settings
 from .controllers import auth_controller, health_controller
@@ -58,6 +59,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _warn_on_insecure_secret()
 
     await init_repository()
+
+    try:
+        await ensure_guest_organization()
+    except Exception as exc:  # noqa: BLE001 — best-effort; register() retries this per guest signup
+        logger.warning("Auth Service: could not bootstrap the Guest organization at startup: %s", exc)
+
     logger.info(
         "Auth Service ready — mongo=%s db=%s",
         "configured" if auth_settings.mongo_uri else "in-memory (no AUTH_MONGO_URI)",

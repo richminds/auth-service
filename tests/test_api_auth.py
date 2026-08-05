@@ -143,7 +143,7 @@ def test_register_with_unknown_org_id_is_404(client):
 
 def test_guest_can_join_an_organization(client):
     token, user = register(client, "guest@b.com", "Guest")
-    assert user["org_id"] is None
+    assert user["org_id"] == "Guest"  # shared Guest org, not unassigned
 
     org_id = client.post("/auth/organizations/register", json={"name": "Acme"}).json()["org_id"]
     r = client.post(
