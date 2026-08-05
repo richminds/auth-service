@@ -64,6 +64,8 @@ def create_access_token(
     now = datetime.now(timezone.utc)
     payload: dict[str, Any] = {
         "sub": subject,
+        "iss": auth_settings.jwt_issuer,
+        "aud": auth_settings.jwt_audience,
         "jti": secrets.token_hex(16),
         "iat": now,
         "exp": now + timedelta(minutes=ttl_minutes or auth_settings.access_ttl_minutes),
@@ -73,5 +75,11 @@ def create_access_token(
 
 
 def decode_token(token: str) -> dict[str, Any]:
-    """Verify signature + expiry. Raises jwt.PyJWTError on any failure."""
-    return jwt.decode(token, auth_settings.jwt_secret, algorithms=[auth_settings.jwt_algorithm])
+    """Verify signature + expiry + issuer/audience. Raises jwt.PyJWTError on any failure."""
+    return jwt.decode(
+        token,
+        auth_settings.jwt_secret,
+        algorithms=[auth_settings.jwt_algorithm],
+        issuer=auth_settings.jwt_issuer,
+        audience=auth_settings.jwt_audience,
+    )

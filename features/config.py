@@ -38,6 +38,21 @@ class AuthSettings(BaseSettings):
     jwt_secret: str = Field(default="dev-secret-change-me", validation_alias="AUTH_JWT_SECRET")
     jwt_algorithm: str = Field(default="HS256", validation_alias="AUTH_JWT_ALGORITHM")
     access_ttl_minutes: int = Field(default=720, validation_alias="AUTH_ACCESS_TTL_MINUTES")
+    # This service is the trust root for end-user identity (sub, org_id, ...) —
+    # llm-gateway and knowledge-service each validate tokens minted here rather
+    # than issuing their own, so `iss` must equal their configured
+    # LLM_JWT_ISSUER/RAG_JWT_ISSUER and `aud` must include their configured
+    # LLM_JWT_AUDIENCE/RAG_JWT_AUDIENCE. That only works if AUTH_JWT_SECRET
+    # equals LLM_JWT_SECRET and RAG_JWT_SECRET (HS256 is symmetric) — see each
+    # service's .env.example.
+    jwt_issuer: str = Field(default="auth-service", validation_alias="AUTH_JWT_ISSUER")
+    jwt_audience_raw: str = Field(
+        default="llm-gateway,knowledge-service", validation_alias="AUTH_JWT_AUDIENCE"
+    )
+
+    @property
+    def jwt_audience(self) -> list[str]:
+        return [a.strip() for a in self.jwt_audience_raw.split(",") if a.strip()]
 
     # ---------------------------------------------------------------- storage
     # Same shared cluster/db the calling application's monolith writes to by
