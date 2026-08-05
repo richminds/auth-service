@@ -39,6 +39,18 @@ async def test_register_bootstraps_the_guest_organization():
     assert resp.user.org_id == guest.org_id
 
 
+async def test_register_with_explicit_guest_org_id_bootstraps_on_an_empty_db():
+    # The UI's register form defaults its Organization ID field to "Guest"
+    # and sends it explicitly rather than omitting it — this must bootstrap
+    # the org the same as the omitted-org_id path, not 404 on a fresh DB
+    # (a plain existence check would fail here since nothing has created
+    # "Guest" yet in this test's empty in-memory org repository).
+    resp = await service.register(
+        RegisterRequest(email="a@b.com", name="A", password="hunter22", org_id="Guest")
+    )
+    assert resp.user.org_id == service.GUEST_ORG_ID
+
+
 async def test_register_reuses_the_same_guest_organization_for_every_guest():
     resp1 = await service.register(RegisterRequest(email="a@b.com", name="A", password="hunter22"))
     resp2 = await service.register(RegisterRequest(email="c@d.com", name="C", password="hunter22"))

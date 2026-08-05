@@ -93,11 +93,14 @@ async def register(req: RegisterRequest) -> TokenResponse:
 
     if is_portless_user(email):
         org_id = PORTLESS_ORG_ID
-    elif req.org_id:
+    elif req.org_id and req.org_id != GUEST_ORG_ID:
         if await get_org_repository().get(req.org_id) is None:
             raise OrganizationNotFoundError(f"Organization {req.org_id!r} not found")
         org_id = req.org_id
     else:
+        # Omitted, or explicitly "Guest" (what the UI's default sends) — either
+        # way, bootstrap it rather than doing a plain existence check, so the
+        # very first signup ever made against an empty database still works.
         await ensure_guest_organization()
         org_id = GUEST_ORG_ID
 
