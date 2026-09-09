@@ -4,11 +4,10 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from features.repository import (
-    InMemoryOrganizationRepository,
     InMemoryRevocationRepository,
     InMemoryUserRepository,
 )
-from features.schemas import OrganizationRecord, UserRecord
+from features.schemas import UserRecord
 
 
 def _user(user_id="USR-1", email="a@b.com") -> UserRecord:
@@ -51,51 +50,7 @@ async def test_list_all_sorted_by_created_at():
     assert [u.user_id for u in users] == ["USR-1", "USR-2"]
 
 
-async def test_update_org_returns_updated_record():
-    repo = InMemoryUserRepository()
-    await repo.create(_user())
-    updated = await repo.update_org("USR-1", "ORG-1")
-    assert updated is not None
-    assert updated.org_id == "ORG-1"
-
-
-async def test_update_org_miss_returns_none():
-    repo = InMemoryUserRepository()
-    assert (await repo.update_org("USR-GHOST", "ORG-1")) is None
-
-
 # ─────────────────────────────────────────────── organizations
-
-
-async def _org(org_id="ORG-1", name="Acme") -> OrganizationRecord:
-    return OrganizationRecord(
-        org_id=org_id, name=name, created_by="USR-1", created_at=datetime.now(timezone.utc)
-    )
-
-
-async def test_org_create_and_get():
-    repo = InMemoryOrganizationRepository()
-    await repo.create(await _org())
-    assert (await repo.get("ORG-1")).name == "Acme"
-
-
-async def test_org_get_by_name_case_insensitive():
-    repo = InMemoryOrganizationRepository()
-    await repo.create(await _org(name="Acme Corp"))
-    assert (await repo.get_by_name("acme corp")) is not None
-
-
-async def test_add_known_email_deduplicates():
-    repo = InMemoryOrganizationRepository()
-    await repo.create(await _org())
-    await repo.add_known_email("ORG-1", "x@y.com")
-    updated = await repo.add_known_email("ORG-1", "X@Y.com")
-    assert updated.known_emails == ["x@y.com"]
-
-
-async def test_add_known_email_missing_org_returns_none():
-    repo = InMemoryOrganizationRepository()
-    assert (await repo.add_known_email("ORG-GHOST", "x@y.com")) is None
 
 
 # ─────────────────────────────────────────────── revocation

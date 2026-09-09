@@ -196,11 +196,15 @@ async def login(req: LoginRequest) -> TokenResponse:
     # through it. Without this, account_id would only pick a login
     # implementation and never actually mean anything.
     #
-    # Users predating account_id have none at all; those are allowed through
-    # any application rather than being locked out of everything. Tightening
-    # that is a migration, not a code change — see the README.
+    # This check has NO exemption for users with no accounts, and that matters:
+    # it used to skip entirely when `allowed` was empty, so that any user
+    # without a membership could name any account — including the ADMIN one —
+    # and be issued a token scoped to it. Since is_admin is derived from
+    # `account_id == AUTH_ADMIN_ACCOUNT_ID`, that turned "anyone who can sign
+    # up" into "anyone who can become an administrator". A user with no
+    # accounts can still sign in; they just cannot claim one.
     allowed = effective_account_ids(user)
-    if req.account_id and allowed and req.account_id not in allowed:
+    if req.account_id and req.account_id not in allowed:
         logger.warning(
             "Auth: %s belongs to accounts %s but tried to sign in via %s",
             user.user_id,
@@ -229,6 +233,11 @@ async def login(req: LoginRequest) -> TokenResponse:
     # none — the user's default one. A user with several accounts gets a token
     # for the default plus the full list, so the client can offer a choice and
     # exchange it via select_account without asking for the password again.
+    #
+    # Both branches can only produce an account this user belongs to: the
+    # named one was checked against `allowed` above, and `accounts` is derived
+    # from `allowed`. The token's account scope is therefore never something
+    # the client chose for itself.
     selected = req.account_id or (accounts[0].account_id if accounts else None)
     return _token_for(user, account_id=selected, accounts=accounts)
 

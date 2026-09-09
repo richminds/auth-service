@@ -9,9 +9,9 @@ from __future__ import annotations
 from .conftest import ADMIN_ACCOUNT_ID, admin_token, auth_headers, register
 
 
-def _staff(client, portless_emails=None, email: str = "admin@richminds.io") -> str:
+def _staff(client, email: str = "admin@richminds.io") -> str:
     """An administrator: a user belonging to the admin app account. Nothing
-    else grants it — not the portless allowlist, not org_id."""
+    else grants it."""
     return admin_token(client, email)
 
 
@@ -31,16 +31,6 @@ def test_registering_an_app_account_requires_admin(client):
         headers=auth_headers(token),
     )
     assert r.status_code == 403
-
-
-def test_portless_staff_alone_is_not_an_admin(client, portless_emails):
-    """The legacy platform-staff allowlist deliberately confers nothing here —
-    admin means "member of the admin app account", full stop."""
-    portless_emails("legacy@portless.io")
-    token, user = register(client, "legacy@portless.io", "Legacy Staff")
-    assert user["is_portless"] is True
-    assert user["is_admin"] is False
-    assert client.get("/auth/accounts", headers=auth_headers(token)).status_code == 403
 
 
 def test_admin_is_conferred_by_app_account_membership(client):
@@ -335,9 +325,14 @@ def test_login_rejects_a_user_from_a_different_account(client):
     assert r.status_code == 401
 
 
-def test_login_allows_users_that_predate_account_id(client):
-    """Existing users have account_id unset; they must not be locked out of
-    every application by the check above."""
+def test_a_user_with_no_accounts_cannot_claim_one(client):
+    """The membership check has no exemption for users with no accounts.
+
+    It used to skip entirely when the user belonged to nothing, so anyone who
+    could sign up could name the ADMIN account at login and be issued a token
+    scoped to it — and since is_admin is derived from
+    ``account_id == AUTH_ADMIN_ACCOUNT_ID``, that made them an administrator.
+    """
     register(client, "legacy-user@example.com", "Legacy")
     r = client.post(
         "/auth/login",
@@ -347,7 +342,23 @@ def test_login_allows_users_that_predate_account_id(client):
             "account_id": ADMIN_ACCOUNT_ID,
         },
     )
+    # Same error as a bad password: memberships aren't probeable while
+    # unauthenticated.
+    assert r.status_code == 401
+
+
+def test_a_user_with_no_accounts_can_still_sign_in_without_naming_one(client):
+    """They are not locked out — they just get a token with no account scope,
+    and is_admin false."""
+    register(client, "legacy-user@example.com", "Legacy")
+    r = client.post(
+        "/auth/login",
+        json={"email": "legacy-user@example.com", "password": "hunter22"},
+    )
     assert r.status_code == 200
+    user = r.json()["user"]
+    assert user["account_id"] is None
+    assert user["is_admin"] is False
 
 
 def test_login_is_refused_for_a_disabled_application(client):
@@ -418,32 +429,3 @@ def test_disabling_then_re_enabling_restores_login(client):
 # ─────────────────────────────────────────────── separation from organizations
 
 
-def test_app_accounts_and_organizations_are_separate(client, portless_emails):
-    """The whole point of the separate collection: registering an application
-    must not create a tenant, and vice versa.
-
-    Needs both gates: app accounts are admin-only, organizations are still
-    portless-only — which is itself a demonstration that the two concepts are
-    administered independently.
-    """
-    portless_emails("both@richminds.io")
-    token = admin_token(client, "both@richminds.io")
-
-    client.post(
-        "/auth/accounts",
-        json={"account_id": "some-app", "name": "Some App"},
-        headers=auth_headers(token),
-    )
-    org_id = client.post(
-        "/auth/organizations", json={"name": "Some Tenant"}, headers=auth_headers(token)
-    ).json()["org_id"]
-
-    orgs = client.get("/auth/organizations", headers=auth_headers(token)).json()
-    accounts = client.get("/auth/accounts", headers=auth_headers(token)).json()
-    org_ids = [o["org_id"] for o in orgs]
-    account_ids = [a["account_id"] for a in accounts]
-
-    assert "some-app" not in org_ids
-    assert org_id not in account_ids
-    # An org_id is not addressable as an app account, and vice versa.
-    assert client.get(f"/auth/accounts/{org_id}", headers=auth_headers(token)).status_code == 404

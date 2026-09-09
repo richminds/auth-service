@@ -1,5 +1,9 @@
 """Shared fixtures.
 
+There is no platform-staff allowlist any more: "administrator" means
+membership of the admin app account (AUTH_ADMIN_ACCOUNT_ID), which is a fact
+about the user's own record. ``admin_token`` below is the only way to get one.
+
 Every test runs against in-memory repositories — the suite never touches a
 real MongoDB and never needs credentials. With AUTH_MONGO_URI unset,
 ``init_repository()`` (called from the app's lifespan) already falls back to
@@ -18,14 +22,12 @@ import os
 
 os.environ.setdefault("AUTH_MONGO_URI", "")
 os.environ.setdefault("AUTH_JWT_SECRET", "test-secret-not-for-production-use-only")
-os.environ.setdefault("AUTH_PORTLESS_EMAILS", "")
 os.environ.setdefault("AUTHSVC_ENVIRONMENT", "test")
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app.main import app  # noqa: E402
-from features.config import auth_settings  # noqa: E402
 
 
 @pytest.fixture
@@ -34,21 +36,6 @@ def client():
     user/organization/revocation store via the lifespan's init_repository()."""
     with TestClient(app) as c:
         yield c
-
-
-@pytest.fixture
-def portless_emails(monkeypatch):
-    """Set the platform-staff allowlist for the duration of one test.
-
-    ``auth_settings`` is a module-level singleton built once at import time,
-    so tests that need a specific allowlist value patch the attribute
-    directly rather than the env var (which nothing re-reads after import).
-    """
-
-    def _set(raw: str) -> None:
-        monkeypatch.setattr(auth_settings, "portless_emails_raw", raw)
-
-    return _set
 
 
 ADMIN_ACCOUNT_ID = "richminds"
