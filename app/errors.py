@@ -10,6 +10,7 @@ framework-free and importable in-process.
     OrganizationNotFoundError → 404  assigning a user to a nonexistent org, or renaming/deleting one
     UserNotFoundError         → 404  assigning an org to a nonexistent user
     AlreadyAssignedError      → 409  self-service join by an already-assigned user
+    AccountNotAllowedError    → 403  switching to an app account the user doesn't belong to
     OrganizationHasMembersError → 409  deleting an organization that still has members
     OrganizationProtectedError  → 403  deleting a reserved system organization (Guest/Portless)
     AppAccountExistsError       → 409  registering an account_id that is taken
@@ -30,6 +31,7 @@ from features.app_accounts import (
     AppAccountNotFoundError,
 )
 from features.service import (
+    AccountNotAllowedError,
     AlreadyAssignedError,
     EmailTakenError,
     InvalidCredentialsError,
@@ -79,6 +81,10 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(AlreadyAssignedError)
     async def _already_assigned(request: Request, exc: AlreadyAssignedError) -> JSONResponse:
         return _problem(request, 409, "already_assigned", str(exc))
+
+    @app.exception_handler(AccountNotAllowedError)
+    async def _account_not_allowed(request: Request, exc: AccountNotAllowedError) -> JSONResponse:
+        return _problem(request, 403, "account_not_allowed", str(exc))
 
     @app.exception_handler(OrganizationHasMembersError)
     async def _organization_has_members(

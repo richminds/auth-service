@@ -51,13 +51,15 @@ await client.aclose()
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | `POST` | `/auth/register` | none | Create a user, return a token |
-| `POST` | `/auth/login` | none | Authenticate, return a token (`account_id` names the application — see [One login for every application](#one-login-for-every-application)) |
+| `POST` | `/auth/login` | none | Authenticate, return a token + the `accounts` the user may work under (see [One login for every application](#one-login-for-every-application)) |
+| `POST` | `/auth/me/account` | bearer token | Re-issue the token scoped to another [app account](#app-accounts-vs-organizations) the caller belongs to |
 | `GET` | `/auth/me` | bearer token | Current user's profile |
 | `POST` | `/auth/logout` | bearer token | Revoke the token used for this request |
 | `POST` | `/auth/organizations` | platform staff | Create an organization |
 | `GET` | `/auth/organizations` | platform staff | List every organization |
 | `GET` | `/auth/users` | platform staff | List every user + their org assignment |
 | `PATCH` | `/auth/users/{id}/organization` | platform staff | Assign a user to an organization |
+| `PATCH` | `/auth/users/{id}/accounts` | platform staff | Set which applications a user may sign in through ([app accounts](#app-accounts-vs-organizations)) |
 | `POST` | `/auth/accounts` | **admin** | Register an application ([app account](#app-accounts-vs-organizations)) |
 | `GET` | `/auth/accounts` | **admin** | List registered applications |
 | `GET` | `/auth/accounts/{id}` | **admin** | One registered application |
@@ -111,16 +113,45 @@ Two deliberate looseness's remain, both so nothing breaks mid-migration:
 Once every application is registered and every user has an `account_id`, both
 can be tightened — see [Making `account_id` mandatory](#making-account_id-mandatory).
 
-The response's top-level `account_id` echoes what was requested — forward it
-as `X-Account-ID` on later llm-gateway/knowledge-service calls made on that
-user's behalf.
+The response's top-level `account_id` is the application this token is scoped
+to — downstream services (knowledge-service) read it from the verified token
+and scope their data on it, so it's baked into the JWT claims rather than a
+header the caller can spoof.
+
+### Users who belong to more than one application
+
+A user can work across several applications. Staff set this with
+`PATCH /auth/users/{id}/accounts` — `account_id` is their **default** (what a
+login that names no account gets) and `account_ids` lists the **extras**; the
+two are combined by `features/service.py::effective_account_ids`, the single
+place membership is decided.
+
+`POST /auth/login` therefore returns an `accounts` array — every application
+the verified user may sign in through, each `{account_id, name}` — **only after
+the password checks out**, since which applications an email belongs to isn't
+something an unauthenticated caller should be able to enumerate. The token it
+issues is scoped to the account named at login, or the user's default when
+none was named, so a single-account client that never shows a picker still
+gets a usable token.
+
+When there is more than one, the client offers a choice and exchanges it via
+`POST /auth/me/account`, which re-issues the token scoped to the chosen
+application (403 if the user doesn't belong to it, or it's disabled). It has
+to be a token exchange rather than a client-side flag precisely because the
+account is a signed claim the downstream services filter on — see
+[knowledge-service](../knowledge-service/README.md#account-and-tenant-isolation).
+
+A disabled application is dropped from the `accounts` list, so a user is never
+offered one they can't actually use.
 
 ### Making `account_id` mandatory
 
 Not done yet, and the order matters:
 
 1. Register every application in [account-management-ui](../account-management-ui).
-2. Backfill `account_id` on existing user records.
+2. Backfill each user's applications with `PATCH /auth/users/{id}/accounts`
+   (`account_id` for the default, `account_ids` for anyone who works across
+   several).
 3. Update each app to send its `account_id` at login.
 4. Only then make the field required and drop the two allowances above.
 

@@ -10,6 +10,7 @@ from .blacklist import revoke_token
 from .organization import GUEST_ORG_ID, PORTLESS_ORG_ID, is_portless_user
 from .repository import get_org_repository, get_repository
 from .schemas import (
+    LoginAccount,
     LoginRequest,
     OrganizationRecord,
     RegisterRequest,
@@ -56,6 +57,13 @@ class AlreadyAssignedError(Exception):
     a staff-only action (see assign_user_organization)."""
 
 
+class AccountNotAllowedError(Exception):
+    """Raised when a signed-in user asks for a token scoped to an app account
+    they don't belong to (403). Distinct from the login-time check, which
+    reports the same error as a bad password because the caller there is
+    still unauthenticated."""
+
+
 class OrganizationHasMembersError(Exception):
     """Raised when deleting an organization that still has member users (409)
     — deleting it out from under them would leave their `org_id` dangling,
@@ -79,15 +87,21 @@ def _new_org_id() -> str:
     return f"ORG-{uuid4().hex[:12].upper()}"
 
 
-def _token_for(user: UserRecord) -> TokenResponse:
+def _token_for(
+    user: UserRecord,
+    account_id: str | None = None,
+    accounts: list[LoginAccount] | None = None,
+) -> TokenResponse:
+    scoped_account_id = account_id or user.account_id
     token = create_access_token(
         subject=user.user_id,
         extra_claims={
             "email": user.email,
             "name": user.name,
-            # The application the user belongs to. require_admin reads this,
-            # so it has to travel in the token rather than be re-fetched.
-            "account_id": user.account_id,
+            # The application this token is scoped to. require_admin reads
+            # this, and knowledge-service scopes its data on it, so it has to
+            # travel in the token rather than be re-fetched.
+            "account_id": scoped_account_id,
             "org_id": user.org_id,
             "is_portless": is_portless_user(user.email),
         },
@@ -95,8 +109,43 @@ def _token_for(user: UserRecord) -> TokenResponse:
     return TokenResponse(
         access_token=token,
         user=UserPublic.from_record(user),
-        account_id=user.account_id,
+        account_id=scoped_account_id,
+        accounts=accounts or [],
     )
+
+
+def effective_account_ids(user: UserRecord) -> list[str]:
+    """Every app account ``user`` may sign in through, primary one first.
+
+    The single place ``account_id`` (primary) and ``account_ids`` (additional)
+    are combined, so membership means the same thing at login, at account
+    switch, and in the list offered to the client.
+    """
+    ordered = [user.account_id, *user.account_ids]
+    seen: list[str] = []
+    for account_id in ordered:
+        if account_id and account_id not in seen:
+            seen.append(account_id)
+    return seen
+
+
+async def _login_accounts(account_ids: list[str]) -> list[LoginAccount]:
+    """Resolve display names for the accounts offered at login.
+
+    An ID with no app-account record (registered before the collection
+    existed) still appears, named after itself — dropping it would lock the
+    user out of the only account they have.
+    """
+    from .repository import get_app_account_repository
+
+    repo = get_app_account_repository()
+    out: list[LoginAccount] = []
+    for account_id in account_ids:
+        record = await repo.get(account_id)
+        if record is not None and not record.enabled:
+            continue
+        out.append(LoginAccount(account_id=account_id, name=record.name if record else account_id))
+    return out
 
 
 async def register(req: RegisterRequest) -> TokenResponse:
@@ -222,18 +271,19 @@ async def login(req: LoginRequest) -> TokenResponse:
         raise InvalidCredentialsError("Invalid email or password")
 
     # The credentials are valid — but for WHICH application? When the caller
-    # names an account, a user who belongs to a different one must not be let
-    # in through it. Without this, account_id would only pick a login
+    # names an account, a user who does not belong to it must not be let in
+    # through it. Without this, account_id would only pick a login
     # implementation and never actually mean anything.
     #
-    # Users predating account_id have it unset; those are allowed through any
-    # application rather than being locked out of everything. Tightening that
-    # is a migration, not a code change — see the README.
-    if req.account_id and user.account_id and user.account_id != req.account_id:
+    # Users predating account_id have none at all; those are allowed through
+    # any application rather than being locked out of everything. Tightening
+    # that is a migration, not a code change — see the README.
+    allowed = effective_account_ids(user)
+    if req.account_id and allowed and req.account_id not in allowed:
         logger.warning(
-            "Auth: %s belongs to account %s but tried to sign in via %s",
+            "Auth: %s belongs to accounts %s but tried to sign in via %s",
             user.user_id,
-            user.account_id,
+            allowed,
             req.account_id,
         )
         # Same error as a bad password: which accounts a user belongs to
@@ -253,7 +303,37 @@ async def login(req: LoginRequest) -> TokenResponse:
             logger.warning("Auth: could not upgrade password hash for %s: %s", user.user_id, exc)
 
     logger.info("Auth: login OK for %s (account=%s)", user.user_id, req.account_id)
-    return _token_for(user)
+    accounts = await _login_accounts(allowed)
+    # Scope the token to the account the caller named, or — when they named
+    # none — the user's default one. A user with several accounts gets a token
+    # for the default plus the full list, so the client can offer a choice and
+    # exchange it via select_account without asking for the password again.
+    selected = req.account_id or (accounts[0].account_id if accounts else None)
+    return _token_for(user, account_id=selected, accounts=accounts)
+
+
+async def select_account(user_id: str, account_id: str) -> TokenResponse:
+    """Re-issue the caller's token scoped to one of their own app accounts.
+
+    The post-login half of multi-account sign-in: the account is baked into
+    the token's claims (knowledge-service scopes its data on it), so switching
+    means a new token. Membership is re-checked against the stored record
+    rather than trusted from the request.
+    """
+    user = await get_repository().get_by_id(user_id)
+    if user is None:
+        raise UserNotFoundError(f"User {user_id!r} not found")
+
+    allowed = effective_account_ids(user)
+    if account_id not in allowed:
+        raise AccountNotAllowedError(f"You do not belong to application {account_id!r}")
+
+    from .app_accounts import assert_login_allowed
+
+    await assert_login_allowed(account_id)
+
+    logger.info("Auth: user %s switched to account %s", user_id, account_id)
+    return _token_for(user, account_id=account_id, accounts=await _login_accounts(allowed))
 
 
 async def logout(token: str, user_id: str) -> None:
@@ -343,6 +423,36 @@ async def assign_user_organization(user_id: str, org_id: str) -> UserPublic:
         raise UserNotFoundError(f"User {user_id!r} not found")
 
     logger.info("Auth: user %s assigned to organization %s", user_id, org_id)
+    return UserPublic.from_record(updated)
+
+
+async def assign_user_accounts(
+    user_id: str, account_id: str | None, account_ids: list[str]
+) -> UserPublic:
+    """Set which app accounts a user may sign in through (staff only).
+
+    Every ID is validated against the app-account collection first, so a typo
+    can't leave a user pointed at an application that doesn't exist — they'd
+    only find out at the account picker.
+    """
+    from .app_accounts import AppAccountNotFoundError
+    from .repository import get_app_account_repository
+
+    repo = get_app_account_repository()
+    extras: list[str] = []
+    for candidate in [account_id, *account_ids]:
+        if not candidate:
+            continue
+        if await repo.get(candidate) is None:
+            raise AppAccountNotFoundError(f"App account {candidate!r} not found")
+        if candidate != account_id and candidate not in extras:
+            extras.append(candidate)
+
+    updated = await get_repository().update_accounts(user_id, account_id, extras)
+    if updated is None:
+        raise UserNotFoundError(f"User {user_id!r} not found")
+
+    logger.info("Auth: user %s accounts set to %s", user_id, effective_account_ids(updated))
     return UserPublic.from_record(updated)
 
 

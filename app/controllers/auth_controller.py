@@ -12,6 +12,7 @@ from features import app_accounts, service
 from features.dependencies import AuthUser, get_current_user, require_admin, require_portless
 from features.schemas import (
     AppAccountRecord,
+    AssignUserAccountsRequest,
     AssignUserOrgRequest,
     CreateAppAccountRequest,
     CreateOrganizationRequest,
@@ -19,6 +20,7 @@ from features.schemas import (
     OrganizationRecord,
     RegisterRequest,
     RenameOrganizationRequest,
+    SelectAccountRequest,
     TokenResponse,
     UpdateAppAccountRequest,
     UserPublic,
@@ -54,11 +56,32 @@ async def login(payload: LoginRequest) -> TokenResponse:
     always checked against this service's own user store — this service is
     the source of truth for identity, it doesn't reach into an application's
     private database.
+
+    The response lists every application this user may sign in through
+    (``accounts``) — only after the password has been verified, so an
+    unauthenticated caller can't probe an email's memberships. More than one
+    entry means the client should let the user pick, then exchange the choice
+    via POST /auth/me/account.
     """
     if payload.account_id:
         await app_accounts.assert_login_allowed(payload.account_id)
 
     return await service.login(payload)
+
+
+@router.post("/me/account", response_model=TokenResponse)
+async def select_my_account(
+    payload: SelectAccountRequest,
+    user: AuthUser = Depends(get_current_user),
+) -> TokenResponse:
+    """Re-issue the caller's token scoped to one of their own applications.
+
+    The second half of a multi-account sign-in: 403 if the user doesn't belong
+    to that application, or if it's disabled. Needed as its own endpoint
+    because the account is a token claim — downstream services scope their
+    data on it, so switching means a new token, not a client-side flag.
+    """
+    return await service.select_account(user.user_id, payload.account_id)
 
 
 @router.get("/me", response_model=UserPublic)
@@ -195,6 +218,21 @@ async def assign_user_organization(
 ) -> UserPublic:
     """Assign a user to an organization."""
     return await service.assign_user_organization(user_id, payload.org_id)
+
+
+@router.patch("/users/{user_id}/accounts", response_model=UserPublic)
+async def assign_user_accounts(
+    user_id: str,
+    payload: AssignUserAccountsRequest,
+    _: AuthUser = Depends(require_portless),
+) -> UserPublic:
+    """Set which applications a user may sign in through.
+
+    ``account_id`` is their default (what a login that names no account gets);
+    ``account_ids`` are the extras that make the sign-in account picker appear.
+    404 if any of them isn't a registered app account.
+    """
+    return await service.assign_user_accounts(user_id, payload.account_id, payload.account_ids)
 
 
 # ---------------------------------------------------------------------------

@@ -36,6 +36,9 @@ class UserRepository(Protocol):
     async def create(self, user: UserRecord) -> None: ...
     async def list_all(self) -> list[UserRecord]: ...
     async def update_org(self, user_id: str, org_id: str) -> UserRecord | None: ...
+    async def update_accounts(
+        self, user_id: str, account_id: str | None, account_ids: list[str]
+    ) -> UserRecord | None: ...
     async def update_password_hash(self, user_id: str, password_hash: str) -> None: ...
 
 
@@ -97,6 +100,18 @@ class InMemoryUserRepository:
         if user is None:
             return None
         updated = user.model_copy(update={"org_id": org_id})
+        self._by_id[user_id] = updated
+        return updated
+
+    async def update_accounts(
+        self, user_id: str, account_id: str | None, account_ids: list[str]
+    ) -> UserRecord | None:
+        user = self._by_id.get(user_id)
+        if user is None:
+            return None
+        updated = user.model_copy(
+            update={"account_id": account_id, "account_ids": list(account_ids)}
+        )
         self._by_id[user_id] = updated
         return updated
 
@@ -244,6 +259,21 @@ class MongoUserRepository:
         d = await self._col.find_one_and_update(
             {"user_id": user_id},
             {"$set": {"org_id": org_id}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if d is None:
+            return None
+        d.pop("_id", None)
+        return UserRecord(**d)
+
+    async def update_accounts(
+        self, user_id: str, account_id: str | None, account_ids: list[str]
+    ) -> UserRecord | None:
+        from pymongo import ReturnDocument
+
+        d = await self._col.find_one_and_update(
+            {"user_id": user_id},
+            {"$set": {"account_id": account_id, "account_ids": list(account_ids)}},
             return_document=ReturnDocument.AFTER,
         )
         if d is None:

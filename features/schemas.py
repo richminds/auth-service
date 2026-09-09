@@ -28,6 +28,11 @@ class UserRecord(BaseModel):
     name: str
     password_hash: str
     account_id: str | None = None
+    account_ids: list[str] = Field(default_factory=list)
+    """Additional app accounts this user may sign in through, beyond
+    ``account_id`` (their primary/default one). A user who works across two
+    applications picks one at login — see service.effective_account_ids, which
+    is the single place the two fields are combined."""
     org_id: str | None = None
     created_at: datetime
 
@@ -39,6 +44,7 @@ class UserPublic(BaseModel):
     email: str
     name: str
     account_id: str | None = None
+    account_ids: list[str] = Field(default_factory=list)
     org_id: str | None = None
     is_admin: bool = False
     """True when the user belongs to the configured admin app account — the
@@ -59,6 +65,7 @@ class UserPublic(BaseModel):
             email=r.email,
             name=r.name,
             account_id=r.account_id,
+            account_ids=list(r.account_ids),
             org_id=r.org_id,
             is_admin=bool(r.account_id) and r.account_id == auth_settings.admin_account_id,
             is_portless=is_portless_user(r.email),
@@ -92,14 +99,44 @@ class LoginRequest(BaseModel):
     omitting it skips the membership check."""
 
 
+class LoginAccount(BaseModel):
+    """One app account a user may sign in through, as offered at login.
+
+    Only the fields a sign-in picker needs — the full AppAccountRecord is
+    staff-only administration data.
+    """
+
+    account_id: str
+    name: str
+
+
+class SelectAccountRequest(BaseModel):
+    account_id: str = Field(min_length=1, max_length=64)
+
+
+class AssignUserAccountsRequest(BaseModel):
+    account_id: str | None = Field(default=None, max_length=64)
+    """The user's primary/default app account."""
+    account_ids: list[str] = Field(default_factory=list)
+    """Every additional app account the user may sign in through."""
+
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: UserPublic
     account_id: str | None = None
-    """The application the user belongs to. Callers that go on to call
-    llm-gateway/knowledge-service on this user's behalf can forward it as
-    their X-Account-ID header."""
+    """The application this token is scoped to — the account named at login,
+    or the user's only/default one. Baked into the token's claims, so
+    switching accounts means getting a new token (POST /auth/me/account).
+    Callers that go on to call llm-gateway/knowledge-service on this user's
+    behalf forward it as their account scope."""
+    accounts: list[LoginAccount] = Field(default_factory=list)
+    """Every app account this user may sign in through. Returned only after
+    the password has been verified — which accounts an email belongs to is not
+    something an unauthenticated caller should be able to probe. More than one
+    entry means the client should let the user pick and then call
+    POST /auth/me/account."""
 
 
 # ---------------------------------------------------------------------------
