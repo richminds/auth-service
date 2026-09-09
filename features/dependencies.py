@@ -27,10 +27,14 @@ class AuthUser(BaseModel):
     user_id: str
     email: str | None = None
     name: str | None = None
+    account_id: str | None = None
+    """The application this user belongs to (an app account). Membership of the
+    configured admin app account is what require_admin checks."""
     org_id: str | None = None
     is_portless: bool = False
-    """True for platform staff (see features/organization.py) — such callers
-    bypass per-organization data filtering everywhere."""
+    """Legacy platform-staff flag (see features/organization.py) — such callers
+    bypass per-organization data filtering in knowledge-service. Deliberately
+    NOT used to gate account administration; see require_admin."""
 
 
 def _user_from_claims(claims: dict) -> AuthUser:
@@ -38,13 +42,19 @@ def _user_from_claims(claims: dict) -> AuthUser:
         user_id=str(claims.get("sub")),
         email=claims.get("email"),
         name=claims.get("name"),
+        account_id=claims.get("account_id"),
         org_id=claims.get("org_id"),
         is_portless=bool(claims.get("is_portless", False)),
     )
 
 
 async def get_current_user(request: Request) -> AuthUser:
-    """Return the authenticated user or raise 401."""
+    """Return the authenticated user or raise 401.
+
+    Every token this service accepts is one it issued itself
+    (features/security.py) — there is a single token format, so a single
+    verifier.
+    """
     cached = getattr(request.state, "user", None)
     if isinstance(cached, AuthUser):
         return cached
@@ -57,23 +67,26 @@ async def get_current_user(request: Request) -> AuthUser:
             headers={"WWW-Authenticate": "Bearer"},
         )
     token = auth.split(" ", 1)[1].strip()
+
     try:
         claims = decode_token(token)
     except Exception as exc:  # noqa: BLE001 — any decode/expiry failure → 401
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid or expired token: {exc}",
+            detail="Invalid or expired token",
             headers={"WWW-Authenticate": "Bearer"},
         ) from exc
 
-    if await is_token_revoked(claims.get("jti")):
+    user = _user_from_claims(claims)
+    jti = claims.get("jti")
+
+    if await is_token_revoked(jti):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token has been revoked — please log in again",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    user = _user_from_claims(claims)
     request.state.user = user
     return user
 
@@ -96,6 +109,25 @@ def require_org_scope(user: AuthUser) -> str | None:
                    "Contact an administrator.",
         )
     return user.org_id
+
+
+def require_admin(user: AuthUser = Depends(get_current_user)) -> AuthUser:
+    """FastAPI dependency: 403s unless the caller belongs to the admin app
+    account (``AUTH_ADMIN_ACCOUNT_ID``, the RichMinds admin application).
+
+    This is the gate on app-account administration. It is deliberately
+    independent of the legacy portless allowlist: admin here means "a member
+    of the admin application", which is a fact about the user's own record,
+    not an email on a deploy-time list.
+    """
+    from .config import auth_settings
+
+    if not user.account_id or user.account_id != auth_settings.admin_account_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This feature is restricted to administrators.",
+        )
+    return user
 
 
 def require_portless(user: AuthUser = Depends(get_current_user)) -> AuthUser:

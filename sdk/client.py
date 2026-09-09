@@ -49,6 +49,9 @@ class TokenResponse:
     access_token: str
     user: UserPublic
     token_type: str = "bearer"
+    account_id: str | None = None
+    """The application the user belongs to. Forward it as X-Account-ID on
+    later llm-gateway/knowledge-service calls made on this user's behalf."""
 
 
 @dataclass
@@ -128,11 +131,23 @@ class AuthServiceClient:
         d = r.json()
         return TokenResponse(access_token=d["access_token"], user=_user_from_dict(d["user"]))
 
-    async def login(self, email: str, password: str) -> TokenResponse:
-        r = await self._client.post("/auth/login", json={"email": email, "password": password})
+    async def login(
+        self, email: str, password: str, account_id: str | None = None
+    ) -> TokenResponse:
+        """Log in. Pass ``account_id`` to name the application this login is
+        for — it must be enabled and the user must belong to it (see
+        features/app_accounts.py in this service)."""
+        payload: dict[str, Any] = {"email": email, "password": password}
+        if account_id is not None:
+            payload["account_id"] = account_id
+        r = await self._client.post("/auth/login", json=payload)
         _raise_for_error(r)
         d = r.json()
-        return TokenResponse(access_token=d["access_token"], user=_user_from_dict(d["user"]))
+        return TokenResponse(
+            access_token=d["access_token"],
+            user=_user_from_dict(d["user"]),
+            account_id=d.get("account_id"),
+        )
 
     async def me(self, token: str) -> UserPublic:
         r = await self._client.get("/auth/me", headers=self._auth_headers(token))
@@ -175,6 +190,21 @@ class AuthServiceClient:
         )
         _raise_for_error(r)
         return OrganizationRecord(**r.json())
+
+    async def rename_organization(self, token: str, org_id: str, name: str) -> OrganizationRecord:
+        r = await self._client.patch(
+            f"/auth/organizations/{org_id}", json={"name": name}, headers=self._auth_headers(token)
+        )
+        _raise_for_error(r)
+        return OrganizationRecord(**r.json())
+
+    async def delete_organization(self, token: str, org_id: str) -> None:
+        """Raises AuthServiceError(409) if the organization still has member
+        users, or (403) for the reserved Guest/Portless organizations."""
+        r = await self._client.delete(
+            f"/auth/organizations/{org_id}", headers=self._auth_headers(token)
+        )
+        _raise_for_error(r)
 
     async def list_organizations(self, token: str) -> list[OrganizationRecord]:
         r = await self._client.get("/auth/organizations", headers=self._auth_headers(token))

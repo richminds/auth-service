@@ -21,6 +21,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from features import __version__
+from features.app_accounts import ensure_admin_account
 from features.config import auth_settings
 from features.repository import close_repository, init_repository
 from features.service import ensure_guest_organization
@@ -64,6 +65,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await ensure_guest_organization()
     except Exception as exc:  # noqa: BLE001 — best-effort; register() retries this per guest signup
         logger.warning("Auth Service: could not bootstrap the Guest organization at startup: %s", exc)
+
+    # Membership of this account is what grants admin access, so it has to
+    # exist before the first administrator can be tied to it.
+    try:
+        await ensure_admin_account()
+    except Exception as exc:  # noqa: BLE001 — best effort, same as above
+        logger.warning("Auth Service: could not bootstrap the admin app account: %s", exc)
 
     logger.info(
         "Auth Service ready — mongo=%s db=%s",

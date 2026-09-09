@@ -51,11 +51,36 @@ def portless_emails(monkeypatch):
     return _set
 
 
+ADMIN_ACCOUNT_ID = "richminds"
+"""Mirrors auth_settings.admin_account_id — membership of this app account is
+what makes a user an administrator (features/dependencies.py::require_admin)."""
+
+
 def register(client, email: str, name: str, password: str = "hunter22") -> tuple[str, dict]:
     r = client.post("/auth/register", json={"email": email, "name": name, "password": password})
     assert r.status_code == 201, r.text
     body = r.json()
     return body["access_token"], body["user"]
+
+
+def admin_token(client, email: str = "admin@richminds.io", password: str = "hunter22") -> str:
+    """Register the first administrator and return their token.
+
+    Self-registration into the admin account is allowed exactly once per
+    store (see service.register), and each test gets a fresh in-memory store,
+    so this works once per test — call it before any other admin exists.
+    """
+    r = client.post(
+        "/auth/register",
+        json={
+            "email": email,
+            "name": "Admin",
+            "password": password,
+            "account_id": ADMIN_ACCOUNT_ID,
+        },
+    )
+    assert r.status_code == 201, r.text
+    return r.json()["access_token"]
 
 
 def auth_headers(token: str) -> dict:

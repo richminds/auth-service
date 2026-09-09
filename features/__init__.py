@@ -12,6 +12,15 @@ Quick start::
 Model names, secrets and storage are declared in exactly one place
 (``config.py``).
 """
+from .app_accounts import (
+    AppAccountExistsError,
+    AppAccountNotFoundError,
+    create_app_account,
+    delete_app_account,
+    get_app_account,
+    list_app_accounts,
+    update_app_account,
+)
 from .blacklist import is_token_revoked, revoke_token
 from .config import AuthSettings, auth_settings
 from .dependencies import AuthUser, get_current_user, require_org_scope, require_portless
@@ -30,24 +39,31 @@ from .repository import (
     init_repository,
 )
 from .schemas import (
+    AppAccountRecord,
     AssignUserOrgRequest,
+    CreateAppAccountRequest,
     CreateOrganizationRequest,
     LoginRequest,
     OrganizationRecord,
     RegisterRequest,
     TokenResponse,
+    UpdateAppAccountRequest,
     UserPublic,
     UserRecord,
 )
 from .security import create_access_token, decode_token, hash_password, verify_password
 from .service import (
+    AlreadyAssignedError,
     EmailTakenError,
     InvalidCredentialsError,
     InvalidEmailError,
+    OrganizationHasMembersError,
     OrganizationNotFoundError,
+    OrganizationProtectedError,
     UserNotFoundError,
     assign_user_organization,
     create_organization,
+    delete_organization,
     find_or_create_organization_for_deal,
     get_user,
     list_organizations,
@@ -55,6 +71,7 @@ from .service import (
     login,
     logout,
     register,
+    rename_organization,
 )
 
 __version__ = "1.0.0"
@@ -89,6 +106,17 @@ __all__ = [
     "OrganizationRecord",
     "CreateOrganizationRequest",
     "AssignUserOrgRequest",
+    # app accounts (registered applications — not tenants)
+    "AppAccountRecord",
+    "CreateAppAccountRequest",
+    "UpdateAppAccountRequest",
+    "create_app_account",
+    "list_app_accounts",
+    "get_app_account",
+    "update_app_account",
+    "delete_app_account",
+    "AppAccountExistsError",
+    "AppAccountNotFoundError",
     # repository
     "UserRepository",
     "OrganizationRepository",
@@ -102,11 +130,14 @@ __all__ = [
     "init_repository",
     "close_repository",
     # service
+    "AlreadyAssignedError",
     "register",
     "login",
     "logout",
     "get_user",
     "create_organization",
+    "rename_organization",
+    "delete_organization",
     "list_organizations",
     "list_users",
     "assign_user_organization",
@@ -115,5 +146,7 @@ __all__ = [
     "InvalidEmailError",
     "InvalidCredentialsError",
     "OrganizationNotFoundError",
+    "OrganizationHasMembersError",
+    "OrganizationProtectedError",
     "UserNotFoundError",
 ]

@@ -257,6 +257,118 @@ def test_assigning_a_nonexistent_organization_is_404(client, portless_emails):
     assert r.status_code == 404
 
 
+# ─────────────────────────────────────────────── organization rename / delete
+
+
+def _create_org(client, admin_token: str, name: str = "Acme") -> str:
+    r = client.post("/auth/organizations", json={"name": name}, headers=auth_headers(admin_token))
+    assert r.status_code == 201, r.text
+    return r.json()["org_id"]
+
+
+def test_staff_can_rename_an_organization(client, portless_emails):
+    portless_emails("admin@portless.io")
+    admin_token, _ = register(client, "admin@portless.io", "Admin")
+    org_id = _create_org(client, admin_token)
+
+    r = client.patch(
+        f"/auth/organizations/{org_id}",
+        json={"name": "Acme Corp"},
+        headers=auth_headers(admin_token),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["name"] == "Acme Corp"
+    assert r.json()["org_id"] == org_id
+
+
+def test_non_staff_cannot_rename_an_organization(client, portless_emails):
+    portless_emails("admin@portless.io")
+    admin_token, _ = register(client, "admin@portless.io", "Admin")
+    org_id = _create_org(client, admin_token)
+    non_staff_token, _ = register(client, "not-admin@example.com", "Not Admin")
+
+    r = client.patch(
+        f"/auth/organizations/{org_id}",
+        json={"name": "Hijacked"},
+        headers=auth_headers(non_staff_token),
+    )
+    assert r.status_code == 403
+
+
+def test_renaming_an_unknown_organization_is_404(client, portless_emails):
+    portless_emails("admin@portless.io")
+    admin_token, _ = register(client, "admin@portless.io", "Admin")
+
+    r = client.patch(
+        "/auth/organizations/ORG-GHOST", json={"name": "X"}, headers=auth_headers(admin_token)
+    )
+    assert r.status_code == 404
+
+
+def test_staff_can_delete_an_empty_organization(client, portless_emails):
+    portless_emails("admin@portless.io")
+    admin_token, _ = register(client, "admin@portless.io", "Admin")
+    org_id = _create_org(client, admin_token)
+
+    r = client.delete(f"/auth/organizations/{org_id}", headers=auth_headers(admin_token))
+    assert r.status_code == 204
+
+    r = client.get("/auth/organizations", headers=auth_headers(admin_token))
+    assert org_id not in [o["org_id"] for o in r.json()]
+
+
+def test_non_staff_cannot_delete_an_organization(client, portless_emails):
+    portless_emails("admin@portless.io")
+    admin_token, _ = register(client, "admin@portless.io", "Admin")
+    org_id = _create_org(client, admin_token)
+    non_staff_token, _ = register(client, "not-admin2@example.com", "Not Admin")
+
+    r = client.delete(f"/auth/organizations/{org_id}", headers=auth_headers(non_staff_token))
+    assert r.status_code == 403
+
+
+def test_deleting_an_unknown_organization_is_404(client, portless_emails):
+    portless_emails("admin@portless.io")
+    admin_token, _ = register(client, "admin@portless.io", "Admin")
+
+    r = client.delete("/auth/organizations/ORG-GHOST", headers=auth_headers(admin_token))
+    assert r.status_code == 404
+
+
+def test_deleting_an_organization_with_members_is_409(client, portless_emails):
+    portless_emails("admin@portless.io")
+    admin_token, _ = register(client, "admin@portless.io", "Admin")
+    org_id = _create_org(client, admin_token)
+    _, member = register(client, "member@example.com", "Member")
+    client.patch(
+        f"/auth/users/{member['user_id']}/organization",
+        json={"org_id": org_id},
+        headers=auth_headers(admin_token),
+    )
+
+    r = client.delete(f"/auth/organizations/{org_id}", headers=auth_headers(admin_token))
+    assert r.status_code == 409
+
+    r = client.get("/auth/organizations", headers=auth_headers(admin_token))
+    assert org_id in [o["org_id"] for o in r.json()]
+
+
+def test_deleting_the_guest_organization_is_403(client, portless_emails):
+    portless_emails("admin@portless.io")
+    admin_token, _ = register(client, "admin@portless.io", "Admin")
+
+    r = client.delete("/auth/organizations/Guest", headers=auth_headers(admin_token))
+    assert r.status_code == 403
+
+
+def test_deleting_the_portless_organization_is_403(client, portless_emails):
+    portless_emails("admin@portless.io")
+    admin_token, _ = register(client, "admin@portless.io", "Admin")
+
+    r = client.delete("/auth/organizations/portless", headers=auth_headers(admin_token))
+    assert r.status_code == 403
+
+
 # ─────────────────────────────────────────────── health
 
 

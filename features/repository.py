@@ -15,16 +15,18 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Protocol, runtime_checkable
 
 from .config import auth_settings
-from .schemas import OrganizationRecord, UserRecord
+from .schemas import AppAccountRecord, OrganizationRecord, UserRecord
 
 logger = logging.getLogger(__name__)
 
 _user_repository: "UserRepository | None" = None
 _org_repository: "OrganizationRepository | None" = None
 _revocation_repository: "RevocationRepository | None" = None
+_app_account_repository: "AppAccountRepository | None" = None
 
 
 @runtime_checkable
@@ -34,6 +36,7 @@ class UserRepository(Protocol):
     async def create(self, user: UserRecord) -> None: ...
     async def list_all(self) -> list[UserRecord]: ...
     async def update_org(self, user_id: str, org_id: str) -> UserRecord | None: ...
+    async def update_password_hash(self, user_id: str, password_hash: str) -> None: ...
 
 
 @runtime_checkable
@@ -43,12 +46,26 @@ class OrganizationRepository(Protocol):
     async def get_by_name(self, name: str) -> OrganizationRecord | None: ...
     async def list_all(self) -> list[OrganizationRecord]: ...
     async def add_known_email(self, org_id: str, email: str) -> OrganizationRecord | None: ...
+    async def rename(self, org_id: str, name: str) -> OrganizationRecord | None: ...
+    async def delete(self, org_id: str) -> bool: ...
 
 
 @runtime_checkable
 class RevocationRepository(Protocol):
     async def revoke(self, jti: str, ttl_seconds: int) -> None: ...
     async def is_revoked(self, jti: str) -> bool: ...
+
+
+@runtime_checkable
+class AppAccountRepository(Protocol):
+    """Registered applications — separate storage from organizations (tenants).
+    See features/schemas.py::AppAccountRecord for why they aren't the same."""
+
+    async def create(self, account: AppAccountRecord) -> None: ...
+    async def get(self, account_id: str) -> AppAccountRecord | None: ...
+    async def list_all(self) -> list[AppAccountRecord]: ...
+    async def update(self, account_id: str, changes: dict) -> AppAccountRecord | None: ...
+    async def delete(self, account_id: str) -> bool: ...
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +100,11 @@ class InMemoryUserRepository:
         self._by_id[user_id] = updated
         return updated
 
+    async def update_password_hash(self, user_id: str, password_hash: str) -> None:
+        user = self._by_id.get(user_id)
+        if user is not None:
+            self._by_id[user_id] = user.model_copy(update={"password_hash": password_hash})
+
 
 class InMemoryOrganizationRepository:
     def __init__(self) -> None:
@@ -114,6 +136,44 @@ class InMemoryOrganizationRepository:
         updated = org.model_copy(update={"known_emails": [*org.known_emails, email]})
         self._by_id[org_id] = updated
         return updated
+
+    async def rename(self, org_id: str, name: str) -> OrganizationRecord | None:
+        org = self._by_id.get(org_id)
+        if org is None:
+            return None
+        updated = org.model_copy(update={"name": name})
+        self._by_id[org_id] = updated
+        return updated
+
+    async def delete(self, org_id: str) -> bool:
+        return self._by_id.pop(org_id, None) is not None
+
+
+class InMemoryAppAccountRepository:
+    def __init__(self) -> None:
+        self._by_id: dict[str, AppAccountRecord] = {}
+
+    async def create(self, account: AppAccountRecord) -> None:
+        if account.account_id in self._by_id:
+            raise ValueError(f"App account {account.account_id!r} already exists")
+        self._by_id[account.account_id] = account
+
+    async def get(self, account_id: str) -> AppAccountRecord | None:
+        return self._by_id.get(account_id)
+
+    async def list_all(self) -> list[AppAccountRecord]:
+        return sorted(self._by_id.values(), key=lambda a: a.created_at)
+
+    async def update(self, account_id: str, changes: dict) -> AppAccountRecord | None:
+        account = self._by_id.get(account_id)
+        if account is None:
+            return None
+        updated = account.model_copy(update=changes)
+        self._by_id[account_id] = updated
+        return updated
+
+    async def delete(self, account_id: str) -> bool:
+        return self._by_id.pop(account_id, None) is not None
 
 
 class InMemoryRevocationRepository:
@@ -191,6 +251,11 @@ class MongoUserRepository:
         d.pop("_id", None)
         return UserRecord(**d)
 
+    async def update_password_hash(self, user_id: str, password_hash: str) -> None:
+        await self._col.update_one(
+            {"user_id": user_id}, {"$set": {"password_hash": password_hash}}
+        )
+
 
 class MongoOrganizationRepository:
     def __init__(self, col) -> None:
@@ -242,6 +307,80 @@ class MongoOrganizationRepository:
         d.pop("_id", None)
         return OrganizationRecord(**d)
 
+    async def rename(self, org_id: str, name: str) -> OrganizationRecord | None:
+        from pymongo import ReturnDocument
+
+        d = await self._col.find_one_and_update(
+            {"org_id": org_id},
+            {"$set": {"name": name}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if d is None:
+            return None
+        d.pop("_id", None)
+        return OrganizationRecord(**d)
+
+    async def delete(self, org_id: str) -> bool:
+        result = await self._col.delete_one({"org_id": org_id})
+        return result.deleted_count > 0
+
+
+class MongoAppAccountRepository:
+    def __init__(self, col) -> None:
+        self._col = col
+
+    async def create(self, account: AppAccountRecord) -> None:
+        # Relies on the unique index on account_id (init_repository) to reject
+        # a duplicate that slipped past the service-layer existence check.
+        await self._col.insert_one(account.model_dump(mode="json"))
+
+    async def get(self, account_id: str) -> AppAccountRecord | None:
+        d = await self._col.find_one({"account_id": account_id})
+        if d is None:
+            return None
+        d.pop("_id", None)
+        return AppAccountRecord(**d)
+
+    async def list_all(self) -> list[AppAccountRecord]:
+        cursor = self._col.find({}).sort("created_at", 1)
+        docs = await cursor.to_list(length=10_000)
+        accounts = []
+        for d in docs:
+            d.pop("_id", None)
+            try:
+                accounts.append(AppAccountRecord(**d))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Skipping malformed app account document: %s", exc)
+        return accounts
+
+    async def update(self, account_id: str, changes: dict) -> AppAccountRecord | None:
+        from pymongo import ReturnDocument
+
+        # create() writes via model_dump(mode="json"), so datetimes are ISO
+        # strings and enums are their plain values. Match that here rather than
+        # mixing in BSON dates or enum objects.
+        def _encode(v):
+            if isinstance(v, datetime):
+                return v.isoformat()
+            if isinstance(v, Enum):
+                return v.value
+            return v
+
+        encoded = {k: _encode(v) for k, v in changes.items()}
+        d = await self._col.find_one_and_update(
+            {"account_id": account_id},
+            {"$set": encoded},
+            return_document=ReturnDocument.AFTER,
+        )
+        if d is None:
+            return None
+        d.pop("_id", None)
+        return AppAccountRecord(**d)
+
+    async def delete(self, account_id: str) -> bool:
+        result = await self._col.delete_one({"account_id": account_id})
+        return result.deleted_count > 0
+
 
 class MongoRevocationRepository:
     """TTL-indexed collection — a revoked entry expires at the same moment the
@@ -280,7 +419,7 @@ class MongoRevocationRepository:
 async def init_repository() -> None:
     """Initialise the process-wide repositories. Idempotent-ish: safe to call
     once at startup; falls back to in-memory storage on any Mongo failure."""
-    global _user_repository, _org_repository, _revocation_repository
+    global _user_repository, _org_repository, _revocation_repository, _app_account_repository
 
     if not auth_settings.mongo_uri:
         logger.warning(
@@ -290,6 +429,7 @@ async def init_repository() -> None:
         _user_repository = InMemoryUserRepository()
         _org_repository = InMemoryOrganizationRepository()
         _revocation_repository = InMemoryRevocationRepository()
+        _app_account_repository = InMemoryAppAccountRepository()
         return
 
     try:
@@ -318,12 +458,19 @@ async def init_repository() -> None:
         ])
         _revocation_repository = MongoRevocationRepository(revoked_col)
 
+        app_accounts_col = conn.get_collection(auth_settings.app_accounts_collection)
+        await app_accounts_col.create_indexes([
+            IndexModel([("account_id", ASCENDING)], unique=True, name="account_id_unique"),
+        ])
+        _app_account_repository = MongoAppAccountRepository(app_accounts_col)
+
         logger.info("Auth repository: MongoDB (db=%s)", conn.db_name)
     except Exception as exc:  # noqa: BLE001
         logger.error("Auth: MongoDB connection failed (%s) — falling back to in-memory.", exc)
         _user_repository = InMemoryUserRepository()
         _org_repository = InMemoryOrganizationRepository()
         _revocation_repository = InMemoryRevocationRepository()
+        _app_account_repository = InMemoryAppAccountRepository()
 
 
 async def close_repository() -> None:
@@ -348,3 +495,9 @@ def get_revocation_repository() -> RevocationRepository:
     if _revocation_repository is None:
         raise RuntimeError("Auth repository not initialised — call init_repository() at startup.")
     return _revocation_repository
+
+
+def get_app_account_repository() -> AppAccountRepository:
+    if _app_account_repository is None:
+        raise RuntimeError("Auth repository not initialised — call init_repository() at startup.")
+    return _app_account_repository

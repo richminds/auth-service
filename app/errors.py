@@ -7,9 +7,13 @@ framework-free and importable in-process.
     InvalidEmailError         → 422  malformed email at registration
     EmailTakenError           → 409  email already registered
     InvalidCredentialsError   → 401  bad email/password at login
-    OrganizationNotFoundError → 404  assigning a user to a nonexistent org
+    OrganizationNotFoundError → 404  assigning a user to a nonexistent org, or renaming/deleting one
     UserNotFoundError         → 404  assigning an org to a nonexistent user
     AlreadyAssignedError      → 409  self-service join by an already-assigned user
+    OrganizationHasMembersError → 409  deleting an organization that still has members
+    OrganizationProtectedError  → 403  deleting a reserved system organization (Guest/Portless)
+    AppAccountExistsError       → 409  registering an account_id that is taken
+    AppAccountNotFoundError     → 404  reading/updating/deleting an unknown account_id
 """
 from __future__ import annotations
 
@@ -19,12 +23,20 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from features.app_accounts import (
+    AdminAccountClosedError,
+    AppAccountDisabledError,
+    AppAccountExistsError,
+    AppAccountNotFoundError,
+)
 from features.service import (
     AlreadyAssignedError,
     EmailTakenError,
     InvalidCredentialsError,
     InvalidEmailError,
+    OrganizationHasMembersError,
     OrganizationNotFoundError,
+    OrganizationProtectedError,
     UserNotFoundError,
 )
 
@@ -67,3 +79,37 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(AlreadyAssignedError)
     async def _already_assigned(request: Request, exc: AlreadyAssignedError) -> JSONResponse:
         return _problem(request, 409, "already_assigned", str(exc))
+
+    @app.exception_handler(OrganizationHasMembersError)
+    async def _organization_has_members(
+        request: Request, exc: OrganizationHasMembersError
+    ) -> JSONResponse:
+        return _problem(request, 409, "organization_has_members", str(exc))
+
+    @app.exception_handler(OrganizationProtectedError)
+    async def _organization_protected(
+        request: Request, exc: OrganizationProtectedError
+    ) -> JSONResponse:
+        return _problem(request, 403, "organization_protected", str(exc))
+
+    @app.exception_handler(AppAccountDisabledError)
+    async def _app_account_disabled(
+        request: Request, exc: AppAccountDisabledError
+    ) -> JSONResponse:
+        return _problem(request, 403, "app_account_disabled", str(exc))
+
+    @app.exception_handler(AdminAccountClosedError)
+    async def _admin_account_closed(
+        request: Request, exc: AdminAccountClosedError
+    ) -> JSONResponse:
+        return _problem(request, 403, "admin_account_closed", str(exc))
+
+    @app.exception_handler(AppAccountExistsError)
+    async def _app_account_exists(request: Request, exc: AppAccountExistsError) -> JSONResponse:
+        return _problem(request, 409, "app_account_exists", str(exc))
+
+    @app.exception_handler(AppAccountNotFoundError)
+    async def _app_account_not_found(
+        request: Request, exc: AppAccountNotFoundError
+    ) -> JSONResponse:
+        return _problem(request, 404, "app_account_not_found", str(exc))

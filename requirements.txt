@@ -10,3 +10,6 @@ PyJWT>=2.8
 # ── Persistence (users, organizations, revoked-token blacklist) ──────────────
 motor>=3.3
 pymongo>=4.6
+
+# ── Password hashing (bcrypt for new hashes + imported-hash verification) ────
+bcrypt>=4.2.0

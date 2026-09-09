@@ -6,7 +6,7 @@ verbatim, so an existing ``.env`` value copies straight across):
 
     AUTH_JWT_SECRET           — HMAC signing key (CHANGE in production)
     AUTH_JWT_ALGORITHM        — default HS256
-    AUTH_ACCESS_TTL_MINUTES   — access-token lifetime in minutes, default 720 (12h)
+    AUTH_ACCESS_TTL_MINUTES   — access-token lifetime in minutes, default 60
     AUTH_MONGO_URI            — falls back to bare MONGO_URI when unset
     AUTH_MONGO_DB_NAME        — falls back to bare MONGO_DB_NAME, default "portless"
     AUTH_PORTLESS_EMAILS      — comma-separated allowlist of platform-staff emails
@@ -37,7 +37,12 @@ class AuthSettings(BaseSettings):
     # ------------------------------------------------------------------- JWT
     jwt_secret: str = Field(default="dev-secret-change-me", validation_alias="AUTH_JWT_SECRET")
     jwt_algorithm: str = Field(default="HS256", validation_alias="AUTH_JWT_ALGORITHM")
-    access_ttl_minutes: int = Field(default=720, validation_alias="AUTH_ACCESS_TTL_MINUTES")
+    # Downstream services verify tokens locally and never see this service's
+    # revocation list, so this value IS the window in which a logged-out or
+    # deleted user still works against them (see the README's token lifecycle
+    # section). Kept short for that reason; there is no refresh token, so
+    # raising it trades revocation latency for fewer re-logins.
+    access_ttl_minutes: int = Field(default=60, validation_alias="AUTH_ACCESS_TTL_MINUTES")
     # This service is the trust root for end-user identity (sub, org_id, ...) —
     # llm-gateway and knowledge-service each validate tokens minted here rather
     # than issuing their own, so `iss` must equal their configured
@@ -67,6 +72,25 @@ class AuthSettings(BaseSettings):
     users_collection: str = "users"
     organizations_collection: str = "organizations"
     revoked_tokens_collection: str = "revoked_tokens"
+    # Registered applications (see features/app_accounts.py). Deliberately its
+    # own collection, not the organizations one: an organization is a TENANT
+    # that users belong to, an app account is an APPLICATION that authenticates
+    # against this service (the value it sends as LoginRequest.account_id).
+    app_accounts_collection: str = "app_accounts"
+
+    # ------------------------------------------------------------ password hash
+    # bcrypt cost factor for new passwords. 12 is the current default and
+    # matches what makemerich-backend writes, so imported hashes don't all
+    # look stale. Raising it re-hashes each user on their next successful
+    # login (features/security.py::needs_rehash) rather than at once.
+    bcrypt_rounds: int = Field(default=12, validation_alias="AUTH_BCRYPT_ROUNDS")
+
+    # ------------------------------------------------------------------- admin
+    # Administering this service (app accounts) is gated on membership of ONE
+    # app account — the RichMinds admin application. A user whose
+    # UserRecord.account_id equals this value is an admin; nobody else is.
+    # Nothing else confers it: not the portless allowlist below, not org_id.
+    admin_account_id: str = Field(default="richminds", validation_alias="AUTH_ADMIN_ACCOUNT_ID")
 
     # --------------------------------------------------------------- allowlist
     # Explicit allowlist of platform-staff emails (comma-separated). There is
