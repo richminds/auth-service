@@ -59,6 +59,9 @@ def test_unlisted_origin_is_not_allowed(monkeypatch):
 @pytest.mark.parametrize(
     "origin",
     [
+        # The production aliases the two UIs are actually served from.
+        "https://knowledge-ingest-ui.vercel.app",
+        "https://account-management-ui.vercel.app",
         "https://account-management.vercel.app",
         # Vercel mints one of these per deployment and per preview.
         "https://account-management-oxvwvjvdk-karpoora-sundarapandians-projects.vercel.app",
