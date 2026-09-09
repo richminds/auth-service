@@ -24,7 +24,6 @@ from features import __version__
 from features.app_accounts import ensure_admin_account
 from features.config import auth_settings
 from features.repository import close_repository, init_repository
-from features.service import ensure_guest_organization
 
 from .config import service_settings
 from .controllers import auth_controller, health_controller
@@ -61,11 +60,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     await init_repository()
 
-    try:
-        await ensure_guest_organization()
-    except Exception as exc:  # noqa: BLE001 — best-effort; register() retries this per guest signup
-        logger.warning("Auth Service: could not bootstrap the Guest organization at startup: %s", exc)
-
     # Membership of this account is what grants admin access, so it has to
     # exist before the first administrator can be tied to it.
     try:
@@ -91,7 +85,7 @@ def create_app() -> FastAPI:
         version=__version__,
         description=(
             "Registration, login, JWT issuance/validation, logout (token "
-            "revocation), and organization admin (platform-staff only). "
+            "revocation), and app-account administration (administrators only). "
             "Extracted from the calling application's backend/services/auth "
             "+ backend/shared/auth as a standalone, network-callable service."
         ),

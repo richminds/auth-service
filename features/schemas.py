@@ -1,4 +1,13 @@
-"""Request/response models for the Auth service."""
+"""Request/response models for the Auth service.
+
+One scope, not two. A user belongs to APP ACCOUNTS (``account_id`` plus
+``account_ids``) and nothing else — there is no separate organization or
+tenant field, and downstream services scope their data on the account.
+
+The login/registration response carries the user ONCE: ``account_id``,
+``account_ids`` and ``accounts`` all live inside ``user`` rather than being
+repeated at the top level.
+"""
 from __future__ import annotations
 
 from datetime import datetime
@@ -6,21 +15,19 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field, field_validator
 
-from .organization import is_portless_user
-
 
 class UserRecord(BaseModel):
     """Stored user document (password is hashed, never returned).
 
-    Two independent groupings, deliberately not the same field:
+    ``account_id`` ties the user to the APPLICATION they belong to — an app
+    account (see app_accounts.py). It is the only scope: membership of the
+    configured admin app account (``AUTH_ADMIN_ACCOUNT_ID``) is what
+    ``require_admin`` checks, and downstream services filter their data on the
+    same value.
 
-    ``account_id`` ties the user to the APPLICATION they belong to — an
-    app account (see app_accounts.py). This is what makes someone an admin of
-    this service: membership of the configured admin app account
-    (``AUTH_ADMIN_ACCOUNT_ID``) is the only thing ``require_admin`` checks.
-
-    ``org_id`` ties the user to their ORGANIZATION (tenant) within whichever
-    application they use. Every org-scoped data query filters on this value.
+    Documents written before the organization concept was removed may still
+    carry an ``org_id`` field; pydantic ignores unknown keys, so they load
+    unchanged and the value is simply no longer read.
     """
 
     user_id: str
@@ -33,31 +40,40 @@ class UserRecord(BaseModel):
     ``account_id`` (their primary/default one). A user who works across two
     applications picks one at login — see service.effective_account_ids, which
     is the single place the two fields are combined."""
-    org_id: str | None = None
     created_at: datetime
 
 
 class UserPublic(BaseModel):
-    """User info safe to return to clients / embed in tokens."""
+    """The user, as returned to clients and embedded in tokens.
+
+    This is the ONLY place account membership appears in a response — the
+    login/registration envelope does not repeat it. ``account_id`` is the
+    account this session is scoped to, ``account_ids`` every account the user
+    may use, and ``accounts`` the same set with display names for a picker.
+    """
 
     user_id: str
     email: str
     name: str
     account_id: str | None = None
+    """The account this session is scoped to. Downstream services filter their
+    data on it, so it travels in the token."""
     account_ids: list[str] = Field(default_factory=list)
-    org_id: str | None = None
+    """Every account this user may sign in through, primary one first."""
+    accounts: list["LoginAccount"] = Field(default_factory=list)
+    """The same accounts with display names. Populated only where a client
+    needs to choose between them (login, register, account switch); an
+    id-and-name pair rather than two positional lists, so a name that happens
+    to be duplicated can still be resolved back to its account."""
     is_admin: bool = False
     """True when the user belongs to the configured admin app account — the
-    only gate on the account-administration endpoints. Independent of
-    is_portless below."""
-    is_portless: bool = False
-    """Legacy platform-staff flag from the AUTH_PORTLESS_EMAILS allowlist.
-    Still emitted because knowledge-service reads this claim to bypass
-    per-org filtering; it plays no part in account administration."""
+    only gate on the account-administration endpoints."""
     created_at: datetime | None = None
 
     @classmethod
-    def from_record(cls, r: UserRecord) -> "UserPublic":
+    def from_record(
+        cls, r: UserRecord, accounts: list["LoginAccount"] | None = None
+    ) -> "UserPublic":
         from .config import auth_settings
 
         return cls(
@@ -66,9 +82,8 @@ class UserPublic(BaseModel):
             name=r.name,
             account_id=r.account_id,
             account_ids=list(r.account_ids),
-            org_id=r.org_id,
+            accounts=accounts or [],
             is_admin=bool(r.account_id) and r.account_id == auth_settings.admin_account_id,
-            is_portless=is_portless_user(r.email),
             created_at=r.created_at,
         )
 
@@ -81,11 +96,6 @@ class RegisterRequest(BaseModel):
     """The application this user belongs to (an app account's account_id).
     Must reference a registered app account when given — see
     service.register. Omit for a user who isn't tied to one."""
-    org_id: str | None = Field(default=None, max_length=200)
-    """Optional at signup. If given, must reference an existing organization
-    (see service.register) and the account is created as a member of it.
-    If omitted, the account is created as a guest (org_id stays None) —
-    it can join one later via POST /auth/me/organization."""
 
 
 class LoginRequest(BaseModel):
@@ -122,57 +132,31 @@ class AssignUserAccountsRequest(BaseModel):
 
 
 class TokenResponse(BaseModel):
+    """What a successful sign-in, sign-up or token re-issue returns.
+
+    Deliberately flat: the token, its type, and the user. Everything about
+    account membership lives on ``user`` — repeating ``account_id`` and
+    ``accounts`` at this level meant two copies that could disagree, and
+    clients had no way to know which one was authoritative.
+
+    ``user.accounts`` is populated only after the password has been verified:
+    which accounts an email belongs to is not something an unauthenticated
+    caller should be able to probe. More than one entry means the client
+    should let the user pick, then call POST /auth/me/account.
+    """
+
     access_token: str
     token_type: str = "bearer"
     user: UserPublic
-    account_id: str | None = None
-    """The application this token is scoped to — the account named at login,
-    or the user's only/default one. Baked into the token's claims, so
-    switching accounts means getting a new token (POST /auth/me/account).
-    Callers that go on to call llm-gateway/knowledge-service on this user's
-    behalf forward it as their account scope."""
-    accounts: list[LoginAccount] = Field(default_factory=list)
-    """Every app account this user may sign in through. Returned only after
-    the password has been verified — which accounts an email belongs to is not
-    something an unauthenticated caller should be able to probe. More than one
-    entry means the client should let the user pick and then call
-    POST /auth/me/account."""
-
-
-# ---------------------------------------------------------------------------
-# Organizations (platform-staff admin only — see require_portless)
-# ---------------------------------------------------------------------------
-
-class OrganizationRecord(BaseModel):
-    org_id: str
-    name: str
-    created_by: str
-    """user_id of the staff member who created this organization, or a
-    "system:*" marker when created automatically (see service.py::
-    find_or_create_organization_for_deal)."""
-    known_emails: list[str] = Field(default_factory=list)
-    """Communication emails associated with this organization (lowercased,
-    deduplicated). Lets a staff admin match a new signup's email to the right
-    organization in the assign-user flow."""
-    created_at: datetime
-
-
-class CreateOrganizationRequest(BaseModel):
-    name: str = Field(min_length=1, max_length=200)
-
-
-class RenameOrganizationRequest(BaseModel):
-    name: str = Field(min_length=1, max_length=200)
 
 
 # ---------------------------------------------------------------------------
 # App accounts — the applications registered against this service.
 #
-# NOT organizations. An OrganizationRecord is a tenant that *users* belong to
-# (org_id on UserRecord, used for per-tenant data scoping). An AppAccountRecord
-# is an *application* that authenticates against this service — the value it
-# sends as LoginRequest.account_id when its users sign in. They live in
-# separate collections and neither one implies the other.
+# An AppAccountRecord is an *application* that authenticates against this
+# service — the value it sends as LoginRequest.account_id when its users sign
+# in. It is also the only scope a user has: there is no separate organization
+# or tenant field (see UserRecord).
 # ---------------------------------------------------------------------------
 
 _ACCOUNT_ID_PATTERN = r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$"
@@ -197,9 +181,9 @@ class AppType(StrEnum):
 class AppAccountRecord(BaseModel):
     account_id: str
     """Caller-chosen, stable identifier an application sends as
-    LoginRequest.account_id (e.g. "richminds"). Unlike org_id this is never
-    generated — the application already knows the value it will send, so
-    letting the service mint one would guarantee a mismatch."""
+    LoginRequest.account_id (e.g. "richminds"). Never generated — the
+    application already knows the value it will send, so letting the service
+    mint one would guarantee a mismatch."""
     name: str
     description: str = ""
     app_type: AppType = AppType.OTHER
@@ -251,6 +235,3 @@ class UpdateAppAccountRequest(BaseModel):
     def _check_url(cls, v: str | None) -> str | None:
         return None if v is None else _validate_app_url(v)
 
-
-class AssignUserOrgRequest(BaseModel):
-    org_id: str

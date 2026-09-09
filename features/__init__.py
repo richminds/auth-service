@@ -1,9 +1,11 @@
-"""Auth Service core — registration, login, JWT issuance/validation, organizations.
+"""Auth Service core — registration, login, JWT issuance/validation, app accounts.
 
 Portable core, importable in-process or served over HTTP (see ``app/``).
-Extracted from the calling application's ``backend/services/auth`` +
-``backend/shared/auth`` — a 1:1 feature port; that codebase's own copy is
-untouched.
+
+A user's only scope is the APP ACCOUNT they belong to (``account_id``, plus
+``account_ids`` for anyone who works across several). There is no organization
+or tenant concept: downstream services filter their data on the account, and
+administration is gated on membership of the configured admin app account.
 
 Quick start::
 
@@ -23,29 +25,25 @@ from .app_accounts import (
 )
 from .blacklist import is_token_revoked, revoke_token
 from .config import AuthSettings, auth_settings
-from .dependencies import AuthUser, get_current_user, require_org_scope, require_portless
-from .organization import PORTLESS_ORG_ID, is_portless_user
+from .dependencies import AuthUser, get_current_user, require_admin
 from .repository import (
-    InMemoryOrganizationRepository,
     InMemoryRevocationRepository,
     InMemoryUserRepository,
-    OrganizationRepository,
     RevocationRepository,
     UserRepository,
     close_repository,
-    get_org_repository,
     get_repository,
     get_revocation_repository,
     init_repository,
 )
 from .schemas import (
     AppAccountRecord,
-    AssignUserOrgRequest,
+    AssignUserAccountsRequest,
     CreateAppAccountRequest,
-    CreateOrganizationRequest,
+    LoginAccount,
     LoginRequest,
-    OrganizationRecord,
     RegisterRequest,
+    SelectAccountRequest,
     TokenResponse,
     UpdateAppAccountRequest,
     UserPublic,
@@ -53,25 +51,19 @@ from .schemas import (
 )
 from .security import create_access_token, decode_token, hash_password, verify_password
 from .service import (
-    AlreadyAssignedError,
+    AccountNotAllowedError,
     EmailTakenError,
     InvalidCredentialsError,
     InvalidEmailError,
-    OrganizationHasMembersError,
-    OrganizationNotFoundError,
-    OrganizationProtectedError,
     UserNotFoundError,
-    assign_user_organization,
-    create_organization,
-    delete_organization,
-    find_or_create_organization_for_deal,
+    assign_user_accounts,
+    effective_account_ids,
     get_user,
-    list_organizations,
     list_users,
     login,
     logout,
     register,
-    rename_organization,
+    select_account,
 )
 
 __version__ = "1.0.0"
@@ -92,21 +84,17 @@ __all__ = [
     # dependencies
     "AuthUser",
     "get_current_user",
-    "require_org_scope",
-    "require_portless",
-    # organization
-    "PORTLESS_ORG_ID",
-    "is_portless_user",
+    "require_admin",
     # schemas
     "UserRecord",
     "UserPublic",
     "RegisterRequest",
     "LoginRequest",
+    "LoginAccount",
+    "SelectAccountRequest",
+    "AssignUserAccountsRequest",
     "TokenResponse",
-    "OrganizationRecord",
-    "CreateOrganizationRequest",
-    "AssignUserOrgRequest",
-    # app accounts (registered applications — not tenants)
+    # app accounts (registered applications — a user's only scope)
     "AppAccountRecord",
     "CreateAppAccountRequest",
     "UpdateAppAccountRequest",
@@ -119,34 +107,25 @@ __all__ = [
     "AppAccountNotFoundError",
     # repository
     "UserRepository",
-    "OrganizationRepository",
     "RevocationRepository",
     "InMemoryUserRepository",
-    "InMemoryOrganizationRepository",
     "InMemoryRevocationRepository",
     "get_repository",
-    "get_org_repository",
     "get_revocation_repository",
     "init_repository",
     "close_repository",
     # service
-    "AlreadyAssignedError",
     "register",
     "login",
     "logout",
+    "select_account",
     "get_user",
-    "create_organization",
-    "rename_organization",
-    "delete_organization",
-    "list_organizations",
     "list_users",
-    "assign_user_organization",
-    "find_or_create_organization_for_deal",
+    "assign_user_accounts",
+    "effective_account_ids",
     "EmailTakenError",
     "InvalidEmailError",
     "InvalidCredentialsError",
-    "OrganizationNotFoundError",
-    "OrganizationHasMembersError",
-    "OrganizationProtectedError",
+    "AccountNotAllowedError",
     "UserNotFoundError",
 ]

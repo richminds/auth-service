@@ -9,17 +9,13 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Request, status
 
 from features import app_accounts, service
-from features.dependencies import AuthUser, get_current_user, require_admin, require_portless
+from features.dependencies import AuthUser, get_current_user, require_admin
 from features.schemas import (
     AppAccountRecord,
     AssignUserAccountsRequest,
-    AssignUserOrgRequest,
     CreateAppAccountRequest,
-    CreateOrganizationRequest,
     LoginRequest,
-    OrganizationRecord,
     RegisterRequest,
-    RenameOrganizationRequest,
     SelectAccountRequest,
     TokenResponse,
     UpdateAppAccountRequest,
@@ -38,10 +34,10 @@ async def auth_health() -> dict[str, str]:
 async def register(payload: RegisterRequest) -> TokenResponse:
     """Register a new user.
 
-    ``payload.org_id`` is optional — give it to join that organization
-    immediately (must already exist, see POST /auth/organizations/register).
-    Omit it to sign up as a guest and join one later via
-    POST /auth/me/organization.
+    ``payload.account_id`` is optional and is the user's only scope — the
+    application they belong to. Omit it for a user who is not tied to one
+    yet; an administrator can assign accounts later via
+    PATCH /auth/users/{user_id}/accounts.
     """
     return await service.register(payload)
 
@@ -99,9 +95,7 @@ async def me(user: AuthUser = Depends(get_current_user)) -> UserPublic:
             email=user.email or "",
             name=user.name or "",
             account_id=user.account_id,
-            org_id=user.org_id,
             is_admin=bool(user.account_id) and user.account_id == auth_settings.admin_account_id,
-            is_portless=user.is_portless,
         )
     return found
 
@@ -119,112 +113,24 @@ async def logout(request: Request, user: AuthUser = Depends(get_current_user)) -
 
 
 # ---------------------------------------------------------------------------
-# Organization self-service — no staff gate. Public creation so a new
-# organization can obtain an org_id before anyone has signed up under it;
-# the join endpoint lets a signed-up guest attach themselves to one
-# afterwards, one-way (guest -> assigned), without staff involvement.
+# User administration — administrators only (see require_admin)
+#
+# A user's only scope is the app account(s) they belong to; there is no
+# organization or tenant to manage, so membership is set through the accounts
+# endpoint below and nowhere else.
 # ---------------------------------------------------------------------------
-
-@router.post(
-    "/organizations/register",
-    response_model=OrganizationRecord,
-    status_code=status.HTTP_201_CREATED,
-)
-async def register_organization(payload: CreateOrganizationRequest) -> OrganizationRecord:
-    """Self-serve organization creation — no auth required.
-
-    Returns the new org_id for the caller to hand out to teammates (e.g. in
-    the signup form) or pass to POST /auth/register directly.
-    """
-    return await service.create_organization(payload.name, created_by="self-serve")
-
-
-@router.post("/me/organization", response_model=TokenResponse)
-async def join_my_organization(
-    payload: AssignUserOrgRequest,
-    user: AuthUser = Depends(get_current_user),
-) -> TokenResponse:
-    """Attach the current (guest) user to an organization missed at signup.
-
-    Only works while the account is still unassigned (org_id is None) — once
-    a user belongs to an organization, changing it is staff-only (see
-    PATCH /auth/users/{user_id}/organization) so a user can't unilaterally
-    hop into another organization's scoped data.
-    """
-    return await service.join_organization(user.user_id, payload.org_id)
-
-
-# ---------------------------------------------------------------------------
-# Organization admin — platform staff only (see require_portless)
-# ---------------------------------------------------------------------------
-
-@router.post(
-    "/organizations",
-    response_model=OrganizationRecord,
-    status_code=status.HTTP_201_CREATED,
-)
-async def create_organization(
-    payload: CreateOrganizationRequest,
-    user: AuthUser = Depends(require_portless),
-) -> OrganizationRecord:
-    """Create a new organization."""
-    return await service.create_organization(payload.name, created_by=user.user_id)
-
-
-@router.get("/organizations", response_model=list[OrganizationRecord])
-async def list_organizations(_: AuthUser = Depends(require_portless)) -> list[OrganizationRecord]:
-    """List every organization."""
-    return await service.list_organizations()
-
-
-@router.patch("/organizations/{org_id}", response_model=OrganizationRecord)
-async def rename_organization(
-    org_id: str,
-    payload: RenameOrganizationRequest,
-    _: AuthUser = Depends(require_portless),
-) -> OrganizationRecord:
-    """Rename an organization. 404 if org_id doesn't exist."""
-    return await service.rename_organization(org_id, payload.name)
-
-
-@router.delete(
-    "/organizations/{org_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None
-)
-async def delete_organization(
-    org_id: str,
-    _: AuthUser = Depends(require_portless),
-) -> None:
-    """Delete an organization.
-
-    404 if org_id doesn't exist, 409 if it still has member users (reassign
-    or remove them first — see PATCH /auth/users/{user_id}/organization), 403
-    for the reserved Guest/Portless system organizations (see
-    features/service.py::delete_organization).
-    """
-    await service.delete_organization(org_id)
-
 
 @router.get("/users", response_model=list[UserPublic])
-async def list_users(_: AuthUser = Depends(require_portless)) -> list[UserPublic]:
-    """List every registered user, including their current org assignment."""
+async def list_users(_: AuthUser = Depends(require_admin)) -> list[UserPublic]:
+    """List every registered user, including their account membership."""
     return await service.list_users()
-
-
-@router.patch("/users/{user_id}/organization", response_model=UserPublic)
-async def assign_user_organization(
-    user_id: str,
-    payload: AssignUserOrgRequest,
-    _: AuthUser = Depends(require_portless),
-) -> UserPublic:
-    """Assign a user to an organization."""
-    return await service.assign_user_organization(user_id, payload.org_id)
 
 
 @router.patch("/users/{user_id}/accounts", response_model=UserPublic)
 async def assign_user_accounts(
     user_id: str,
     payload: AssignUserAccountsRequest,
-    _: AuthUser = Depends(require_portless),
+    _: AuthUser = Depends(require_admin),
 ) -> UserPublic:
     """Set which applications a user may sign in through.
 

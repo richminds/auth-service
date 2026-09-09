@@ -10,9 +10,13 @@ Any route can scope itself to the authenticated caller::
 
 Decodes the Authorization header directly (no global middleware stashing the
 user on request.state first) — this service has exactly two access levels
-(any authenticated user, or platform staff), fully expressed by these two
+(any authenticated user, or an administrator), fully expressed by these two
 dependencies, so a blanket middleware isn't needed the way the source
 implementation used one to gate an entire monolith's unrelated routes.
+
+"Administrator" means membership of the configured admin app account. There
+is no separate platform-staff allowlist and no organization scope: an account
+is the only thing a user belongs to.
 """
 from __future__ import annotations
 
@@ -28,13 +32,9 @@ class AuthUser(BaseModel):
     email: str | None = None
     name: str | None = None
     account_id: str | None = None
-    """The application this user belongs to (an app account). Membership of the
-    configured admin app account is what require_admin checks."""
-    org_id: str | None = None
-    is_portless: bool = False
-    """Legacy platform-staff flag (see features/organization.py) — such callers
-    bypass per-organization data filtering in knowledge-service. Deliberately
-    NOT used to gate account administration; see require_admin."""
+    """The application this user belongs to (an app account) and their only
+    scope. Membership of the configured admin app account is what
+    require_admin checks; downstream services filter their data on this."""
 
 
 def _user_from_claims(claims: dict) -> AuthUser:
@@ -43,8 +43,6 @@ def _user_from_claims(claims: dict) -> AuthUser:
         email=claims.get("email"),
         name=claims.get("name"),
         account_id=claims.get("account_id"),
-        org_id=claims.get("org_id"),
-        is_portless=bool(claims.get("is_portless", False)),
     )
 
 
@@ -91,33 +89,12 @@ async def get_current_user(request: Request) -> AuthUser:
     return user
 
 
-def require_org_scope(user: AuthUser) -> str | None:
-    """Resolve the org filter a data-owning endpoint should apply.
-
-    Returns ``None`` for platform staff (unrestricted) or the caller's
-    ``org_id`` otherwise. Raises 403 for a non-staff caller with no
-    ``org_id`` — a real, expected state for a newly self-registered user who
-    hasn't been assigned to an organization yet — instead of silently
-    treating a missing filter as "show everything."
-    """
-    if user.is_portless:
-        return None
-    if not user.org_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Your account is not yet assigned to an organization. "
-                   "Contact an administrator.",
-        )
-    return user.org_id
-
-
 def require_admin(user: AuthUser = Depends(get_current_user)) -> AuthUser:
     """FastAPI dependency: 403s unless the caller belongs to the admin app
     account (``AUTH_ADMIN_ACCOUNT_ID``, the RichMinds admin application).
 
-    This is the gate on app-account administration. It is deliberately
-    independent of the legacy portless allowlist: admin here means "a member
-    of the admin application", which is a fact about the user's own record,
+    This is the gate on app-account and user administration. Admin means "a
+    member of the admin application" — a fact about the user's own record,
     not an email on a deploy-time list.
     """
     from .config import auth_settings
@@ -126,19 +103,5 @@ def require_admin(user: AuthUser = Depends(get_current_user)) -> AuthUser:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="This feature is restricted to administrators.",
-        )
-    return user
-
-
-def require_portless(user: AuthUser = Depends(get_current_user)) -> AuthUser:
-    """FastAPI dependency: 403s unless the caller is platform staff.
-
-    Use to gate features reserved for platform staff (organization admin) —
-    see features/organization.py::is_portless_user.
-    """
-    if not user.is_portless:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="This feature is restricted to platform staff.",
         )
     return user

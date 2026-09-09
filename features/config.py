@@ -1,4 +1,4 @@
-"""Auth domain configuration — JWT, password hashing, storage, Portless allowlist.
+"""Auth domain configuration — JWT, password hashing, storage, admin account.
 
 Env vars (no blanket prefix — names match the source implementation in the
 calling application's ``backend/shared/auth`` + ``backend/services/auth``
@@ -9,10 +9,9 @@ verbatim, so an existing ``.env`` value copies straight across):
     AUTH_ACCESS_TTL_MINUTES   — access-token lifetime in minutes, default 60
     AUTH_MONGO_URI            — falls back to bare MONGO_URI when unset
     AUTH_MONGO_DB_NAME        — falls back to bare MONGO_DB_NAME, default "portless"
-    AUTH_PORTLESS_EMAILS      — comma-separated allowlist of platform-staff emails
 
 This module — and only this module — owns *what* the service authenticates
-against (secret, token lifetime, storage, staff allowlist). ``app/config.py``
+against (secret, token lifetime, storage, admin account). ``app/config.py``
 owns *how the service is exposed* (host/port/CORS/docs), matching the split
 already used by the sibling llm-gateway (``features/config.py`` vs
 ``app/config.py``) and knowledge-service (``rag/config.py`` vs ``app/config.py``).
@@ -43,7 +42,7 @@ class AuthSettings(BaseSettings):
     # section). Kept short for that reason; there is no refresh token, so
     # raising it trades revocation latency for fewer re-logins.
     access_ttl_minutes: int = Field(default=60, validation_alias="AUTH_ACCESS_TTL_MINUTES")
-    # This service is the trust root for end-user identity (sub, org_id, ...) —
+    # This service is the trust root for end-user identity (sub, account_id) —
     # llm-gateway and knowledge-service each validate tokens minted here rather
     # than issuing their own, so `iss` must equal their configured
     # LLM_JWT_ISSUER/RAG_JWT_ISSUER and `aud` must include their configured
@@ -70,12 +69,10 @@ class AuthSettings(BaseSettings):
         default="portless", validation_alias=AliasChoices("AUTH_MONGO_DB_NAME", "MONGO_DB_NAME")
     )
     users_collection: str = "users"
-    organizations_collection: str = "organizations"
     revoked_tokens_collection: str = "revoked_tokens"
-    # Registered applications (see features/app_accounts.py). Deliberately its
-    # own collection, not the organizations one: an organization is a TENANT
-    # that users belong to, an app account is an APPLICATION that authenticates
-    # against this service (the value it sends as LoginRequest.account_id).
+    # Registered applications (see features/app_accounts.py) — the value an
+    # application sends as LoginRequest.account_id, and the only scope a user
+    # has.
     app_accounts_collection: str = "app_accounts"
 
     # ------------------------------------------------------------ password hash
@@ -89,20 +86,7 @@ class AuthSettings(BaseSettings):
     # Administering this service (app accounts) is gated on membership of ONE
     # app account — the RichMinds admin application. A user whose
     # UserRecord.account_id equals this value is an admin; nobody else is.
-    # Nothing else confers it: not the portless allowlist below, not org_id.
     admin_account_id: str = Field(default="richminds", validation_alias="AUTH_ADMIN_ACCOUNT_ID")
-
-    # --------------------------------------------------------------- allowlist
-    # Explicit allowlist of platform-staff emails (comma-separated). There is
-    # no domain matching or other derivation — an email either is or isn't on
-    # this list. See features/organization.py::is_portless_user.
-    portless_emails_raw: str = Field(
-        default="", validation_alias=AliasChoices("AUTH_PORTLESS_EMAILS", "PORTLESS_EMAILS")
-    )
-
-    @property
-    def portless_emails(self) -> set[str]:
-        return {e.strip().lower() for e in self.portless_emails_raw.split(",") if e.strip()}
 
     @property
     def jwt_secret_is_default(self) -> bool:

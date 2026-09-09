@@ -6,15 +6,9 @@ console, and anything onboarded later, each register once here; the
 ``LoginRequest.account_id`` when its users sign in
 (app/controllers/auth_controller.py::login).
 
-Deliberately separate from organizations, in its own collection
-(``AUTH_APP_ACCOUNTS_COLLECTION``, default ``app_accounts``):
-
-    organization  a TENANT users belong to — org_id on UserRecord, the thing
-                  per-tenant data scoping filters on.
-    app account   an APPLICATION that authenticates against this service.
-
-Neither implies the other: one application can serve many organizations, and
-an organization means nothing to an application that doesn't use tenants.
+Stored in its own collection (``app_accounts``). An app account is the ONLY
+scope a user has: it names the application they authenticate against, and it
+is the value downstream services filter their data on.
 
 Registering an application is what lets its users name it at login: the
 account must exist and be enabled, and the user must belong to it (see
@@ -78,7 +72,7 @@ async def ensure_admin_account() -> AppAccountRecord:
     Membership of this account is the only thing that grants administrative
     access (features/dependencies.py::require_admin), so it has to exist before
     anyone can be tied to it — otherwise there is no way to create the first
-    admin. Bootstrapped at startup, same shape as ensure_guest_organization.
+    admin. Bootstrapped at startup, same shape as the user bootstrap.
     """
     from .config import auth_settings
 

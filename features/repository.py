@@ -1,4 +1,4 @@
-"""Auth persistence — users, organizations, and revoked-token collections.
+"""Auth persistence — users, app accounts, and revoked-token collections.
 
 Three backends per entity behind a Protocol: InMemory* (process-local, used
 when no Mongo URI resolves) and Mongo* (Motor, selected once a URI resolves).
@@ -7,7 +7,7 @@ than opening a separate pool per concern.
 
 Persists into the configured AUTH_MONGO_URI / AUTH_MONGO_DB_NAME database —
 by default the SAME shared database the calling application's monolith uses
-(see features/config.py), in its own `users` / `organizations` collections,
+(see features/config.py), in its own `users` / `app_accounts` collections,
 plus a `revoked_tokens` collection (TTL-indexed) that the source
 implementation instead kept in a generic app-wide cache.
 """
@@ -19,12 +19,11 @@ from enum import Enum
 from typing import Protocol, runtime_checkable
 
 from .config import auth_settings
-from .schemas import AppAccountRecord, OrganizationRecord, UserRecord
+from .schemas import AppAccountRecord, UserRecord
 
 logger = logging.getLogger(__name__)
 
 _user_repository: "UserRepository | None" = None
-_org_repository: "OrganizationRepository | None" = None
 _revocation_repository: "RevocationRepository | None" = None
 _app_account_repository: "AppAccountRepository | None" = None
 
@@ -35,7 +34,6 @@ class UserRepository(Protocol):
     async def get_by_id(self, user_id: str) -> UserRecord | None: ...
     async def create(self, user: UserRecord) -> None: ...
     async def list_all(self) -> list[UserRecord]: ...
-    async def update_org(self, user_id: str, org_id: str) -> UserRecord | None: ...
     async def update_accounts(
         self, user_id: str, account_id: str | None, account_ids: list[str]
     ) -> UserRecord | None: ...
@@ -43,16 +41,6 @@ class UserRepository(Protocol):
 
 
 @runtime_checkable
-class OrganizationRepository(Protocol):
-    async def create(self, org: OrganizationRecord) -> None: ...
-    async def get(self, org_id: str) -> OrganizationRecord | None: ...
-    async def get_by_name(self, name: str) -> OrganizationRecord | None: ...
-    async def list_all(self) -> list[OrganizationRecord]: ...
-    async def add_known_email(self, org_id: str, email: str) -> OrganizationRecord | None: ...
-    async def rename(self, org_id: str, name: str) -> OrganizationRecord | None: ...
-    async def delete(self, org_id: str) -> bool: ...
-
-
 @runtime_checkable
 class RevocationRepository(Protocol):
     async def revoke(self, jti: str, ttl_seconds: int) -> None: ...
@@ -61,8 +49,7 @@ class RevocationRepository(Protocol):
 
 @runtime_checkable
 class AppAccountRepository(Protocol):
-    """Registered applications — separate storage from organizations (tenants).
-    See features/schemas.py::AppAccountRecord for why they aren't the same."""
+    """Registered applications — the value a user's account_id points at."""
 
     async def create(self, account: AppAccountRecord) -> None: ...
     async def get(self, account_id: str) -> AppAccountRecord | None: ...
@@ -95,14 +82,6 @@ class InMemoryUserRepository:
     async def list_all(self) -> list[UserRecord]:
         return sorted(self._by_id.values(), key=lambda u: u.created_at)
 
-    async def update_org(self, user_id: str, org_id: str) -> UserRecord | None:
-        user = self._by_id.get(user_id)
-        if user is None:
-            return None
-        updated = user.model_copy(update={"org_id": org_id})
-        self._by_id[user_id] = updated
-        return updated
-
     async def update_accounts(
         self, user_id: str, account_id: str | None, account_ids: list[str]
     ) -> UserRecord | None:
@@ -119,49 +98,6 @@ class InMemoryUserRepository:
         user = self._by_id.get(user_id)
         if user is not None:
             self._by_id[user_id] = user.model_copy(update={"password_hash": password_hash})
-
-
-class InMemoryOrganizationRepository:
-    def __init__(self) -> None:
-        self._by_id: dict[str, OrganizationRecord] = {}
-
-    async def create(self, org: OrganizationRecord) -> None:
-        self._by_id[org.org_id] = org
-
-    async def get(self, org_id: str) -> OrganizationRecord | None:
-        return self._by_id.get(org_id)
-
-    async def get_by_name(self, name: str) -> OrganizationRecord | None:
-        key = name.strip().lower()
-        for o in self._by_id.values():
-            if o.name.strip().lower() == key:
-                return o
-        return None
-
-    async def list_all(self) -> list[OrganizationRecord]:
-        return sorted(self._by_id.values(), key=lambda o: o.created_at)
-
-    async def add_known_email(self, org_id: str, email: str) -> OrganizationRecord | None:
-        org = self._by_id.get(org_id)
-        if org is None:
-            return None
-        email = email.strip().lower()
-        if email in org.known_emails:
-            return org
-        updated = org.model_copy(update={"known_emails": [*org.known_emails, email]})
-        self._by_id[org_id] = updated
-        return updated
-
-    async def rename(self, org_id: str, name: str) -> OrganizationRecord | None:
-        org = self._by_id.get(org_id)
-        if org is None:
-            return None
-        updated = org.model_copy(update={"name": name})
-        self._by_id[org_id] = updated
-        return updated
-
-    async def delete(self, org_id: str) -> bool:
-        return self._by_id.pop(org_id, None) is not None
 
 
 class InMemoryAppAccountRepository:
@@ -253,19 +189,6 @@ class MongoUserRepository:
                 logger.warning("Skipping malformed user document: %s", exc)
         return users
 
-    async def update_org(self, user_id: str, org_id: str) -> UserRecord | None:
-        from pymongo import ReturnDocument
-
-        d = await self._col.find_one_and_update(
-            {"user_id": user_id},
-            {"$set": {"org_id": org_id}},
-            return_document=ReturnDocument.AFTER,
-        )
-        if d is None:
-            return None
-        d.pop("_id", None)
-        return UserRecord(**d)
-
     async def update_accounts(
         self, user_id: str, account_id: str | None, account_ids: list[str]
     ) -> UserRecord | None:
@@ -285,74 +208,6 @@ class MongoUserRepository:
         await self._col.update_one(
             {"user_id": user_id}, {"$set": {"password_hash": password_hash}}
         )
-
-
-class MongoOrganizationRepository:
-    def __init__(self, col) -> None:
-        self._col = col
-
-    async def create(self, org: OrganizationRecord) -> None:
-        await self._col.insert_one(org.model_dump(mode="json"))
-
-    async def get(self, org_id: str) -> OrganizationRecord | None:
-        d = await self._col.find_one({"org_id": org_id})
-        if d is None:
-            return None
-        d.pop("_id", None)
-        return OrganizationRecord(**d)
-
-    async def get_by_name(self, name: str) -> OrganizationRecord | None:
-        import re
-
-        d = await self._col.find_one(
-            {"name": {"$regex": f"^{re.escape(name.strip())}$", "$options": "i"}}
-        )
-        if d is None:
-            return None
-        d.pop("_id", None)
-        return OrganizationRecord(**d)
-
-    async def list_all(self) -> list[OrganizationRecord]:
-        cursor = self._col.find({}).sort("created_at", 1)
-        docs = await cursor.to_list(length=10_000)
-        orgs = []
-        for d in docs:
-            d.pop("_id", None)
-            try:
-                orgs.append(OrganizationRecord(**d))
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Skipping malformed organization document: %s", exc)
-        return orgs
-
-    async def add_known_email(self, org_id: str, email: str) -> OrganizationRecord | None:
-        from pymongo import ReturnDocument
-
-        d = await self._col.find_one_and_update(
-            {"org_id": org_id},
-            {"$addToSet": {"known_emails": email.strip().lower()}},
-            return_document=ReturnDocument.AFTER,
-        )
-        if d is None:
-            return None
-        d.pop("_id", None)
-        return OrganizationRecord(**d)
-
-    async def rename(self, org_id: str, name: str) -> OrganizationRecord | None:
-        from pymongo import ReturnDocument
-
-        d = await self._col.find_one_and_update(
-            {"org_id": org_id},
-            {"$set": {"name": name}},
-            return_document=ReturnDocument.AFTER,
-        )
-        if d is None:
-            return None
-        d.pop("_id", None)
-        return OrganizationRecord(**d)
-
-    async def delete(self, org_id: str) -> bool:
-        result = await self._col.delete_one({"org_id": org_id})
-        return result.deleted_count > 0
 
 
 class MongoAppAccountRepository:
@@ -449,7 +304,7 @@ class MongoRevocationRepository:
 async def init_repository() -> None:
     """Initialise the process-wide repositories. Idempotent-ish: safe to call
     once at startup; falls back to in-memory storage on any Mongo failure."""
-    global _user_repository, _org_repository, _revocation_repository, _app_account_repository
+    global _user_repository, _revocation_repository, _app_account_repository
 
     if not auth_settings.mongo_uri:
         logger.warning(
@@ -457,7 +312,6 @@ async def init_repository() -> None:
             "back to in-memory storage. Data will not survive a restart."
         )
         _user_repository = InMemoryUserRepository()
-        _org_repository = InMemoryOrganizationRepository()
         _revocation_repository = InMemoryRevocationRepository()
         _app_account_repository = InMemoryAppAccountRepository()
         return
@@ -476,12 +330,6 @@ async def init_repository() -> None:
         ])
         _user_repository = MongoUserRepository(users_col)
 
-        orgs_col = conn.get_collection(auth_settings.organizations_collection)
-        await orgs_col.create_indexes([
-            IndexModel([("org_id", ASCENDING)], unique=True, name="org_id_unique"),
-        ])
-        _org_repository = MongoOrganizationRepository(orgs_col)
-
         revoked_col = conn.get_collection(auth_settings.revoked_tokens_collection)
         await revoked_col.create_indexes([
             IndexModel([("expires_at", ASCENDING)], expireAfterSeconds=0, name="ttl_expires_at"),
@@ -498,7 +346,6 @@ async def init_repository() -> None:
     except Exception as exc:  # noqa: BLE001
         logger.error("Auth: MongoDB connection failed (%s) — falling back to in-memory.", exc)
         _user_repository = InMemoryUserRepository()
-        _org_repository = InMemoryOrganizationRepository()
         _revocation_repository = InMemoryRevocationRepository()
         _app_account_repository = InMemoryAppAccountRepository()
 
@@ -513,12 +360,6 @@ def get_repository() -> UserRepository:
     if _user_repository is None:
         raise RuntimeError("Auth repository not initialised — call init_repository() at startup.")
     return _user_repository
-
-
-def get_org_repository() -> OrganizationRepository:
-    if _org_repository is None:
-        raise RuntimeError("Auth repository not initialised — call init_repository() at startup.")
-    return _org_repository
 
 
 def get_revocation_repository() -> RevocationRepository:
