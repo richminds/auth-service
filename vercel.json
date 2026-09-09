@@ -1,6 +1,7 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "env": {
-    "AUTHSVC_CORS_ORIGIN_REGEX": "^https://account-management[a-z0-9-]*\\.vercel\\.app$"
+    "AUTHSVC_CORS_ORIGIN_REGEX": "^https://(account-management|knowledge-ingest-ui)[a-z0-9-]*\\.vercel\\.app$"
+    
   }
 }
