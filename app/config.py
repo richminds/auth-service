@@ -46,6 +46,13 @@ class ServiceSettings(BaseSettings):
     # callers are unaffected. Needed so a web UI can call /auth/login directly.
     cors_origins: str = ""
 
+    # Vercel gives every deployment and every preview its own hostname
+    # (account-management-<hash>-<scope>.vercel.app), so an exact allowlist
+    # goes stale on each deploy and previews are broken by default. A regex
+    # covers the whole family in one rule — anchor it to the projects you
+    # actually own, never leave it open.
+    cors_origin_regex: str = ""
+
     # ------------------------------------------------------------- misc
     request_id_header: str = "X-Request-ID"
     # Expose resolved (non-secret) configuration on GET /v1/config.

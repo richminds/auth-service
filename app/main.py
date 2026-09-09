@@ -105,10 +105,21 @@ def create_app() -> FastAPI:
     app.add_middleware(RequestContextMiddleware)
 
     origins = service_settings.parsed_cors_origins()
-    if origins:
+    origin_regex = service_settings.cors_origin_regex.strip()
+    if origins or origin_regex:
+        if "*" in origins:
+            # Browsers reject a wildcard origin on a credentialed request, and
+            # every call here carries an Authorization header — so "*" doesn't
+            # loosen anything, it just silently blocks everything.
+            logger.warning(
+                "AUTHSVC_CORS_ORIGINS contains '*', which browsers refuse on "
+                "credentialed requests — list real origins, or use "
+                "AUTHSVC_CORS_ORIGIN_REGEX."
+            )
         app.add_middleware(
             CORSMiddleware,
             allow_origins=origins,
+            allow_origin_regex=origin_regex or None,
             allow_credentials=True,
             allow_methods=["*"],
             allow_headers=["*"],
