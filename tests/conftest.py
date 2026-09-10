@@ -85,13 +85,59 @@ def register(client, email: str, name: str, password: str = "hunter22") -> tuple
     return body["access_token"], body["user"]
 
 
-def admin_token(client, email: str = "admin@richminds.io", password: str = "hunter22") -> str:
-    """Register the first administrator and return their token.
+_loop = None
 
-    Self-registration into the admin account is allowed exactly once per
-    store (see service.register), and each test gets a fresh in-memory store,
-    so this works once per test — call it before any other admin exists.
+
+def run_async(coro):
+    """Run ``coro`` on one loop shared by the whole test session.
+
+    Tests reach into the async repositories from sync test bodies, and there
+    are two wrong ways to do it. ``asyncio.run`` creates a loop and then
+    CLOSES it, leaving no current loop — which makes the next
+    ``get_event_loop()`` in another test raise "There is no current event loop"
+    purely because of the order tests ran in. ``get_event_loop()`` on its own
+    is deprecated and creates a loop implicitly. One long-lived loop, created
+    once and never closed, avoids both.
+
+    Safe only because the suite is always on in-memory repositories
+    (AUTH_MONGO_URI is forced empty at the top of this file): those are plain
+    dicts with no event-loop affinity, so this loop can write to the same
+    objects the TestClient's own loop reads. It would NOT be safe against
+    Motor, which binds sockets to the loop that opened them.
     """
+    global _loop
+    import asyncio
+
+    if _loop is None or _loop.is_closed():
+        _loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_loop)
+    return _loop.run_until_complete(coro)
+
+
+def seed_admin_account() -> None:
+    """Create the admin app account, the way an operator does.
+
+    Starting the service no longer creates ANY account (app/main.py), so a
+    fresh store has no admin account and registering into it 404s. This is the
+    test-suite equivalent of running scripts/seed_admin.py: it calls the same
+    ensure_admin_account() that script does, rather than reaching into a
+    repository, so the fixture exercises the real escape hatch instead of a
+    shortcut the product does not have.
+    """
+    from features.app_accounts import ensure_admin_account
+
+    run_async(ensure_admin_account())
+
+
+def admin_token(client, email: str = "admin@richminds.io", password: str = "hunter22") -> str:
+    """Seed the admin account, register the first administrator, return a token.
+
+    Two steps now, because neither happens on its own: nothing creates the
+    admin account at startup, and self-registration into it is allowed exactly
+    once per store (see service.register). Each test gets a fresh in-memory
+    store, so this works once per test — call it before any other admin exists.
+    """
+    seed_admin_account()
     r = client.post(
         "/auth/register",
         json={

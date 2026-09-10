@@ -71,37 +71,84 @@ def test_admin_account_id_is_stable_across_deployments(client):
     assert "legacy_account_id" not in admin
 
 
-def test_the_guest_account_is_bootstrapped_and_open_to_signups(client):
-    """The knowledge console's "Create User" button depends on both halves.
+def test_starting_the_service_creates_no_accounts(client):
+    """Startup is not allowed to invent accounts — not even the admin one.
 
-    It registers people straight into the guest account from a public form, so
-    (a) the account has to exist without anyone creating it, and (b) its ID has
-    to be knowable by a client that has no session — hence a derived UUID that
-    the console can hold as a constant. If either broke, that button would 404.
+    A bootstrap runs on every cold start, so it recreates whatever an operator
+    deleted; a guest account removed on purpose came back the moment the
+    database was reachable again. Nothing is seeded now, and this asserts the
+    absence directly: registering into the admin account fails because the
+    account is not there, which is also the chicken-and-egg that
+    scripts/seed_admin.py exists to break.
     """
-    from features.account_ids import GUEST_ACCOUNT_UUID, account_uuid_for
+    r = client.post(
+        "/auth/register",
+        json={
+            "email": "first@example.com",
+            "name": "First",
+            "password": "hunter22",
+            "account_id": ADMIN_ACCOUNT_ID,
+        },
+    )
+    assert r.status_code == 404, r.text
 
-    assert GUEST_ACCOUNT_UUID == account_uuid_for("guest")
 
+def test_seeding_the_admin_account_breaks_the_cycle(client):
+    """After the operator step, and only after it, an admin can be made."""
+    from .conftest import seed_admin_account
+
+    seed_admin_account()
     token = _staff(client)
     listed = client.get("/auth/accounts", headers=auth_headers(token)).json()
-    guest = next(a for a in listed if a["account_id"] == GUEST_ACCOUNT_UUID)
-    assert guest["name"] == "Guest"
-    assert "legacy_account_id" not in guest
+    # Still exactly one: seeding creates the admin account and nothing else.
+    assert [a["name"] for a in listed] == ["RichMinds"]
 
-    # Public sign-up into it — no admin token involved.
+
+def test_a_public_signup_into_an_unregistered_account_is_refused(client):
+    """The cost of not bootstrapping the guest account, stated as a test.
+
+    The knowledge console's "Create User" button posts a hardcoded account_id
+    from a form with no session. While that account is unregistered the call
+    404s — service.register validates the ID — so the button is broken until a
+    guest account is registered through POST /auth/accounts and the console is
+    configured with the ID it is given.
+    """
+    from features.account_ids import account_uuid_for
+
     r = client.post(
         "/auth/register",
         json={
             "email": "newbie@example.com",
             "name": "Newbie",
             "password": "hunter22",
-            "account_id": GUEST_ACCOUNT_UUID,
+            # The historical derived value the console still pins.
+            "account_id": account_uuid_for("guest"),
+        },
+    )
+    assert r.status_code == 404, r.text
+
+
+def test_a_registered_guest_account_still_takes_public_signups(client):
+    """Registering one by hand restores the flow, and grants nothing extra."""
+    token = _staff(client)
+    guest_id = client.post(
+        "/auth/accounts",
+        json={"name": "Guest", "description": "Public sign-ups."},
+        headers=auth_headers(token),
+    ).json()["account_id"]
+
+    r = client.post(
+        "/auth/register",
+        json={
+            "email": "newbie@example.com",
+            "name": "Newbie",
+            "password": "hunter22",
+            "account_id": guest_id,
         },
     )
     assert r.status_code == 201, r.text
     user = r.json()["user"]
-    assert selected_account(user) == GUEST_ACCOUNT_UUID
+    assert selected_account(user) == guest_id
     # A guest is emphatically not an administrator.
     assert user["is_admin"] is False
     guest_token = r.json()["access_token"]

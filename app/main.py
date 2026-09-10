@@ -21,7 +21,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from features import __version__
-from features.app_accounts import ensure_admin_account, ensure_guest_account
 from features.config import auth_settings
 from features.repository import close_repository, init_repository
 
@@ -60,19 +59,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     await init_repository()
 
-    # Membership of the admin account is what grants admin access, so it has
-    # to exist before the first administrator can be tied to it. The guest
-    # account has to exist before the knowledge console's sign-up can register
-    # anyone into it. Both IDs are derived, so this is safe to re-run.
-    for bootstrap in (ensure_admin_account, ensure_guest_account):
-        try:
-            await bootstrap()
-        except Exception as exc:  # noqa: BLE001 — best effort, same as above
-            logger.warning(
-                "Auth Service: could not bootstrap a well-known app account (%s): %s",
-                bootstrap.__name__,
-                exc,
-            )
+    # NOTHING is created here. Starting this service does not bring any app
+    # account into existence — not the admin one, not a guest one. An account
+    # is a deliberate act by an operator or an administrator, never a side
+    # effect of a process starting.
+    #
+    # Why that is worth the inconvenience: a bootstrap runs on EVERY cold start,
+    # so it silently recreates whatever an operator deleted, and it did — a
+    # guest account removed on purpose came back the moment the database became
+    # reachable again. It also writes records nobody asked for, attributed to
+    # "system:bootstrap", into a database it has only just connected to.
+    #
+    # The consequence is a real chicken-and-egg, stated plainly rather than
+    # worked around: registering the first administrator needs the admin
+    # account to exist, and creating an account through POST /auth/accounts
+    # needs an administrator. A fresh deployment therefore CANNOT bootstrap
+    # itself through the API, by design. Break the cycle out of band, once:
+    #
+    #     python scripts/seed_admin.py
+    #
+    # which creates the admin account and its first administrator together,
+    # through the same repository the service uses. Everything after that is
+    # ordinary API work.
 
     logger.info(
         "Auth Service ready — mongo=%s db=%s",

@@ -51,9 +51,12 @@ def new_account_uuid() -> str:
 ADMIN_ACCOUNT_SLUG = "richminds"
 ADMIN_ACCOUNT_UUID = account_uuid_for(ADMIN_ACCOUNT_SLUG)
 
-# The guest app account. Derived for the same reason the admin one is: the
-# knowledge-ingest console signs new people up into it straight from its own
-# sign-in screen, so it needs an ID it can name before the account exists —
-# there is no admin session in that flow to look one up with.
-GUEST_ACCOUNT_SLUG = "guest"
-GUEST_ACCOUNT_UUID = account_uuid_for(GUEST_ACCOUNT_SLUG)
+# There is deliberately no GUEST_ACCOUNT_UUID any more. The guest account is no
+# longer bootstrapped (app/main.py), so nothing in this service needs to name it
+# before it exists — which was the ONLY reason to derive an ID rather than mint
+# one. A deployment that wants a guest account registers it through
+# POST /auth/accounts and configures the console with the ID it is given.
+#
+# ``account_uuid_for("guest")`` still reproduces the historical value, which is
+# what scripts/migrate_account_uuid.py needs to rewrite databases that were
+# written while the slug was in use.

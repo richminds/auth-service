@@ -16,9 +16,10 @@ WHAT IT DOES
 
        RichMinds  328dc8a2-c30c-5715-920f-21b963b5ce39  (admin)
 
-     The Guest account is deliberately NOT seeded here — the service creates it
-     at startup (``ensure_guest_account``), which is what keeps the knowledge
-     console's public sign-up working on a deployment nobody has seeded.
+     The Guest account is NOT seeded, and nothing else creates it either — the
+     startup bootstrap that used to has been removed. A deployment that wants
+     one registers it through POST /auth/accounts; until then a public sign-up
+     posting a hardcoded guest account_id gets a 404.
 
   3. Creates the seed administrator as ONE user record in RichMinds.
 

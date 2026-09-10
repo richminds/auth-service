@@ -281,12 +281,26 @@ the UUID derived from the original `richminds` slug, see
 `features/account_ids.py`). A user whose `account_id` equals it is an admin — that is the whole rule, and it gates every
 `/auth/accounts` endpoint via `require_admin`.
 
-The account is bootstrapped at startup. The first administrator self-registers
-into it once (`POST /auth/register` with that `account_id`); after that it is
-**closed** to self-registration — otherwise anyone knowing the ID could sign
-up as an admin. Further admins are made with
-[`scripts/seed_admin.py`](scripts/seed_admin.py), which also covers an email
-that already has a user record and so can't self-register.
+**Nothing is created at startup.** Starting the service brings no app account
+into existence — not this one. A bootstrap runs on every cold start, so it
+recreates whatever an operator deleted (a guest account removed on purpose
+came back the moment the database was reachable again) and writes records
+nobody asked for, attributed to `system:bootstrap`.
+
+That leaves a deliberate chicken-and-egg: registering the first administrator
+needs this account to exist, and `POST /auth/accounts` needs an administrator.
+A fresh deployment cannot bootstrap itself through the API. Break the cycle
+once, out of band:
+
+```bash
+python scripts/seed_admin.py            # RichMinds account + its first admin
+python scripts/seed_admin.py --dry-run  # report first
+```
+
+After that the account is **closed** to self-registration — otherwise anyone
+knowing the ID could sign up as an admin — and further admins are made with
+the same script, which also covers an email that already has a user record in
+another application.
 
 
 ## Access model

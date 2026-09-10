@@ -19,18 +19,18 @@ account must exist and be enabled, and the user must belong to it (see
 assert_login_allowed here and features/service.py::login). This service is
 the source of truth for identity — it authenticates against its own user
 store and never reaches into an application's private database.
+
+NO account is created at startup. ``ensure_admin_account`` still exists, but
+it is called by scripts/seed_admin.py and scripts/reset_accounts.py — an
+operator running a command — never by the service coming up. Everything else,
+the guest account included, is registered through create_app_account.
 """
 from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
 
-from .account_ids import (
-    ADMIN_ACCOUNT_SLUG,
-    GUEST_ACCOUNT_SLUG,
-    GUEST_ACCOUNT_UUID,
-    new_account_uuid,
-)
+from .account_ids import ADMIN_ACCOUNT_SLUG, new_account_uuid
 from .repository import get_app_account_repository
 from .schemas import AppAccountRecord, AppType
 
@@ -85,11 +85,16 @@ async def _ensure_account(
     # identifier, which is exactly what moving to UUIDs was meant to end.
     """Idempotently ensure one well-known app account exists.
 
-    Both bootstrapped accounts have IDs that are DERIVED rather than minted
-    (features/account_ids.py), which is what makes bootstrapping them possible
-    at all: something outside this service has to be able to name them before
-    they exist — ``AUTH_ADMIN_ACCOUNT_ID`` for the admin one, the knowledge
-    console's sign-up for the guest one.
+    The admin account's ID is DERIVED rather than minted
+    (features/account_ids.py), which is what makes bootstrapping it possible at
+    all: ``AUTH_ADMIN_ACCOUNT_ID`` has to name the account before it exists, and
+    a randomly minted ID would leave a fresh deployment with an admin gate
+    pointing at nothing.
+
+    Kept as a helper taking the ID and slug, rather than folded into
+    ensure_admin_account, because it is the only place that gets the
+    create-race handling right and a second bootstrapped account would need
+    exactly the same treatment.
     """
     repo = get_app_account_repository()
     existing = await repo.get(account_id)
@@ -116,12 +121,22 @@ async def _ensure_account(
 
 
 async def ensure_admin_account() -> AppAccountRecord:
-    """Idempotently ensure the admin app account exists.
+    """Idempotently create the admin app account. **Operator-invoked only.**
 
-    Membership of this account is the only thing that grants administrative
-    access (features/dependencies.py::require_admin), so it has to exist before
-    anyone can be tied to it — otherwise there is no way to create the first
-    admin.
+    Holding a record in this account is the only thing that grants
+    administrative access (features/dependencies.py::require_admin), so it has
+    to exist before anyone can be tied to it — and it cannot be created through
+    POST /auth/accounts, because that route requires the administrator this
+    account is a prerequisite for.
+
+    This function is how that cycle is broken, and the service no longer calls
+    it at startup: scripts/seed_admin.py does, when an operator runs it. That
+    is the difference between an account existing because someone asked for it
+    and one existing because a process restarted.
+
+    Its ID is derived rather than minted (features/account_ids.py) so
+    ``AUTH_ADMIN_ACCOUNT_ID`` can name it before it exists — every environment
+    and every client agrees on the value without copying it around.
     """
     from .config import auth_settings
 
@@ -134,23 +149,16 @@ async def ensure_admin_account() -> AppAccountRecord:
     )
 
 
-async def ensure_guest_account() -> AppAccountRecord:
-    """Idempotently ensure the guest app account exists.
-
-    The knowledge-ingest console lets people create their own account from its
-    sign-in screen, registering them into THIS account
-    (POST /auth/register with GUEST_ACCOUNT_UUID). That call 404s if the
-    account is missing, so bootstrapping it here is what keeps that button from
-    being broken on a fresh deployment — the same reason the admin account is
-    bootstrapped.
-    """
-    return await _ensure_account(
-        GUEST_ACCOUNT_UUID,
-        GUEST_ACCOUNT_SLUG,
-        "Guest",
-        "Maintains all the Guest user for knowledge service.",
-        AppType.SERVICE,
-    )
+# There is no ensure_guest_account. The knowledge-ingest console's public
+# "Create User" button used to rely on one being bootstrapped; it now has to
+# name an account somebody registered.
+#
+# CONSEQUENCE, deliberately left visible rather than papered over: a public
+# sign-up posting a hardcoded guest account_id gets 404 AppAccountNotFoundError
+# wherever no such account was registered (service.register validates the ID).
+# Register one through POST /auth/accounts and set the console's
+# VITE_GUEST_ACCOUNT_ID to the UUID it mints — minted, so it differs per
+# environment and cannot be hardcoded the way the derived one was.
 
 
 async def create_app_account(

@@ -13,7 +13,7 @@ import pytest
 from features.config import auth_settings
 from features.security import hash_password, needs_rehash, verify_password
 
-from .conftest import auth_headers, register
+from .conftest import auth_headers, register, run_async
 
 # ─────────────────────────────────────────────── what we write
 
@@ -105,13 +105,11 @@ def test_login_upgrades_a_legacy_hash_in_place(client, monkeypatch):
     dk = hashlib.pbkdf2_hmac("sha256", b"hunter22", salt.encode(), 240_000)
     legacy = f"pbkdf2_sha256$240000${salt}${dk.hex()}"
 
-    import asyncio
-
     repo = get_repository()
-    user = asyncio.get_event_loop().run_until_complete(
+    user = run_async(
         repo.get_by_email_account("legacy@example.com", None)
     )
-    asyncio.get_event_loop().run_until_complete(
+    run_async(
         repo.update_password_hash(user.user_id, legacy)
     )
 
@@ -120,7 +118,7 @@ def test_login_upgrades_a_legacy_hash_in_place(client, monkeypatch):
     )
     assert r.status_code == 200, r.text
 
-    upgraded = asyncio.get_event_loop().run_until_complete(
+    upgraded = run_async(
         repo.get_by_email_account("legacy@example.com", None)
     )
     assert upgraded.password_hash.startswith("$2b$")
@@ -133,7 +131,6 @@ def test_login_upgrades_a_legacy_hash_in_place(client, monkeypatch):
 def test_imported_bcrypt_user_can_sign_in(client):
     """The migration case end to end: a user record carrying a foreign bcrypt
     hash logs in through the normal endpoint."""
-    import asyncio
     from datetime import UTC, datetime
 
     from features.repository import get_repository
@@ -147,7 +144,7 @@ def test_imported_bcrypt_user_can_sign_in(client):
         password_hash=foreign_hash,
         created_at=datetime.now(UTC),
     )
-    asyncio.get_event_loop().run_until_complete(get_repository().create(imported))
+    run_async(get_repository().create(imported))
 
     r = client.post(
         "/auth/login",
