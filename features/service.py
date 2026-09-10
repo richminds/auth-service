@@ -61,6 +61,26 @@ def _new_user_id() -> str:
     return f"USR-{uuid4().hex[:12].upper()}"
 
 
+def _role_for(account_id: str | None) -> str:
+    """"admin" for a session scoped to the admin app account, else "user".
+
+    The single derivation of administrator-ness in this service, shared with
+    ``UserPublic.from_record``. Membership of the configured admin app account
+    is the whole rule — there is no separate staff allowlist.
+    """
+    # Imported here rather than at module scope, matching the other settings
+    # reads in this module: the settings singleton is built at import time, and
+    # a module-level import would pin it before the test suite's environment is
+    # in place.
+    from .config import auth_settings
+
+    return (
+        "admin"
+        if account_id and account_id == auth_settings.admin_account_id
+        else "user"
+    )
+
+
 def _token_for(
     user: UserRecord,
     account_id: str | None = None,
@@ -77,6 +97,17 @@ def _token_for(
             # data on it, so it travels in the token rather than being
             # re-fetched on every request.
             "account_id": scoped_account_id,
+            # Derived from the SCOPED account, exactly as UserPublic.is_admin
+            # is (features/schemas.py) — a user who administers one application
+            # is not an administrator of a session scoped to another.
+            #
+            # This service does not read the claim; it is minted for the
+            # services that do. llm-gateway and knowledge-service authorize
+            # their admin routes on a token's "role", and with no such claim
+            # every caller resolved to "user" and those routes were
+            # unreachable for everyone. Named "role" rather than "is_admin"
+            # because that is the key those services already look for.
+            "role": _role_for(scoped_account_id),
         },
     )
     # The account membership lives on the user and nowhere else — the envelope

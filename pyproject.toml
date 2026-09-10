@@ -1,7 +1,7 @@
 [project]
 name = "auth-service"
 version = "1.0.0"
-description = "Standalone authentication/authorization service — register, login, JWT issuance/validation, organizations, Portless-staff allowlist. HTTP service extracted from the calling application backend/services/auth + backend/shared/auth."
+description = "Standalone authentication/authorization service — register, login, JWT issuance/validation, organizations, app-account administration."
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.111",

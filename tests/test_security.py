@@ -41,10 +41,10 @@ def test_token_round_trip():
 
 
 def test_token_carries_extra_claims():
-    token = create_access_token(subject="USR-1", extra_claims={"email": "a@b.com", "is_portless": True})
+    token = create_access_token(subject="USR-1", extra_claims={"email": "a@b.com", "account_id": "acme"})
     claims = decode_token(token)
     assert claims["email"] == "a@b.com"
-    assert claims["is_portless"] is True
+    assert claims["account_id"] == "acme"
 
 
 def test_each_token_has_a_unique_jti():

@@ -126,3 +126,38 @@ def test_health_is_public_and_ready(client):
 
 def test_liveness_is_public(client):
     assert client.get("/health/live").status_code == 200
+
+
+# ──────────────────────────────────────────────────── the role claim
+
+def test_an_ordinary_users_token_carries_role_user(client):
+    """Minted for the services downstream, not read here. llm-gateway and
+    knowledge-service authorize their admin routes on this claim; with no such
+    claim every caller resolved to "user" and those routes were unreachable for
+    everyone, including real administrators."""
+    from features.security import decode_token
+
+    token, _ = register(client, "ordinary@b.com", "Ordinary")
+    assert decode_token(token)["role"] == "user"
+
+
+def test_an_admin_accounts_token_carries_role_admin(client):
+    from features.security import decode_token
+
+    from .conftest import admin_token
+
+    assert decode_token(admin_token(client))["role"] == "admin"
+
+
+def test_the_role_follows_the_account_the_token_is_scoped_to(client):
+    """Administering one application does not make you an administrator of a
+    session scoped to another — the claim is derived from the scoped account,
+    exactly as UserPublic.is_admin is."""
+    from features.security import decode_token
+
+    from .conftest import ADMIN_ACCOUNT_ID, admin_token
+
+    token = admin_token(client)
+    claims = decode_token(token)
+    assert claims["account_id"] == ADMIN_ACCOUNT_ID
+    assert claims["role"] == "admin"

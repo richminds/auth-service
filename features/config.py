@@ -8,7 +8,7 @@ verbatim, so an existing ``.env`` value copies straight across):
     AUTH_JWT_ALGORITHM        — default HS256
     AUTH_ACCESS_TTL_MINUTES   — access-token lifetime in minutes, default 60
     AUTH_MONGO_URI            — falls back to bare MONGO_URI when unset
-    AUTH_MONGO_DB_NAME        — falls back to bare MONGO_DB_NAME, default "portless"
+    AUTH_MONGO_DB_NAME        — falls back to bare MONGO_DB_NAME, default "app"
 
 This module — and only this module — owns *what* the service authenticates
 against (secret, token lifetime, storage, admin account). ``app/config.py``
@@ -66,7 +66,7 @@ class AuthSettings(BaseSettings):
         default="", validation_alias=AliasChoices("AUTH_MONGO_URI", "MONGO_URI")
     )
     mongo_db_name: str = Field(
-        default="portless", validation_alias=AliasChoices("AUTH_MONGO_DB_NAME", "MONGO_DB_NAME")
+        default="app", validation_alias=AliasChoices("AUTH_MONGO_DB_NAME", "MONGO_DB_NAME")
     )
     users_collection: str = "users"
     revoked_tokens_collection: str = "revoked_tokens"

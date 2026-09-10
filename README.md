@@ -55,11 +55,11 @@ await client.aclose()
 | `POST` | `/auth/me/account` | bearer token | Re-issue the token scoped to another [app account](#app-accounts-vs-organizations) the caller belongs to |
 | `GET` | `/auth/me` | bearer token | Current user's profile |
 | `POST` | `/auth/logout` | bearer token | Revoke the token used for this request |
-| `POST` | `/auth/organizations` | platform staff | Create an organization |
-| `GET` | `/auth/organizations` | platform staff | List every organization |
-| `GET` | `/auth/users` | platform staff | List every user + their org assignment |
-| `PATCH` | `/auth/users/{id}/organization` | platform staff | Assign a user to an organization |
-| `PATCH` | `/auth/users/{id}/accounts` | platform staff | Set which applications a user may sign in through ([app accounts](#app-accounts-vs-organizations)) |
+| `POST` | `/auth/organizations` | **admin** | Create an organization |
+| `GET` | `/auth/organizations` | **admin** | List every organization |
+| `GET` | `/auth/users` | **admin** | List every user + their org assignment |
+| `PATCH` | `/auth/users/{id}/organization` | **admin** | Assign a user to an organization |
+| `PATCH` | `/auth/users/{id}/accounts` | **admin** | Set which applications a user may sign in through ([app accounts](#app-accounts-vs-organizations)) |
 | `POST` | `/auth/accounts` | **admin** | Register an application ([app account](#app-accounts-vs-organizations)) |
 | `GET` | `/auth/accounts` | **admin** | List registered applications |
 | `GET` | `/auth/accounts/{id}` | **admin** | One registered application |
@@ -67,10 +67,9 @@ await client.aclose()
 | `DELETE` | `/auth/accounts/{id}` | **admin** | Deregister an application |
 | `GET` | `/health`, `/health/live`, `/health/ready` | none | Liveness/readiness (MongoDB reachability) |
 
-Two independent gates: **"admin"** means the caller belongs to the admin app
-account (see [Administration](#administration)); **"platform staff"** means
-their email is on the legacy `AUTH_PORTLESS_EMAILS` allowlist (see
-[Access model](#access-model)). Neither implies the other.
+**"admin"** means the caller belongs to the admin app account (see
+[Administration](#administration)); every other authenticated caller has
+ordinary user access. There is no separate platform-staff gate.
 
 ## App accounts vs organizations
 
@@ -192,7 +191,7 @@ hashes.
 before relying on logout.**
 
 Login returns a self-describing HS256 JWT — `sub` (user_id), `email`, `name`,
-`account_id`, `org_id`, `is_portless`, plus `iss` / `aud` / `jti` / `iat` /
+`account_id`, `org_id`, plus `iss` / `aud` / `jti` / `iat` /
 `exp`. Callers send it as `Authorization: Bearer …` on every request.
 
 Each service then verifies it **locally**, with no call back here:
@@ -240,21 +239,15 @@ up as an admin. Further admins are made with
 [`scripts/seed_admin.py`](scripts/seed_admin.py), which also covers an email
 that already has a user record and so can't self-register.
 
-The legacy `is_portless` allowlist is unrelated and confers nothing here; it
-still gates the organization endpoints and is still read by knowledge-service.
 
 ## Access model
 
-This section covers the legacy `is_portless` bit, which now gates only the
-organization/user endpoints — app-account administration uses the separate
-rule in [Administration](#administration). `is_portless` asks: is the
-caller's email on the `AUTH_PORTLESS_EMAILS` allowlist? Platform staff get it automatically at
-registration and can create organizations, assign users to them, and list
-every user. Everyone else registers with **no organization** (`org_id` is
-`None`) until a staff admin assigns one via `PATCH /auth/users/{id}/organization`
-— an org-scoped caller with no `org_id` should be treated by *your*
-service as "not yet provisioned," not "sees everything" (see
-`features.dependencies.require_org_scope`).
+Two access levels, and nothing in between: any authenticated user, or an
+**administrator** — a user whose `account_id` is the configured admin app
+account (see [Administration](#administration)). An app account is the only
+thing a user belongs to, and it is what downstream services filter their data
+on. There is no separate platform-staff allowlist and no organization scope
+(see `features/dependencies.py`).
 
 This is intentionally minimal — no roles/permissions table, no refresh
 tokens, no password reset or email verification, no rate-limiting on login,
@@ -290,8 +283,8 @@ implementation instead reused a separate, generic app-wide TTL cache just
 for the revocation blacklist; this service folds that into the same
 connection since it has nothing else to share a pool with.
 
-`AUTH_MONGO_DB_NAME` defaults to `portless` — the same database the calling
-application's monolith already writes `users`/`organizations` into — so this
+`AUTH_MONGO_DB_NAME` defaults to `app` — it can point at an existing database
+another application already writes `users`/`organizations` into, so this
 service can read/write the *same* data during a transition period. Point
 `AUTH_MONGO_URI` at a dedicated cluster once this service is the sole source
 of truth. Leaving `AUTH_MONGO_URI` empty falls back to process-local
@@ -304,7 +297,7 @@ Two settings objects, same split as the sibling services:
 
 - `features/config.py` (`AuthSettings`) — **what** the service authenticates
   against: `AUTH_JWT_SECRET`, `AUTH_JWT_ALGORITHM`, `AUTH_ACCESS_TTL_MINUTES`,
-  `AUTH_MONGO_URI`, `AUTH_MONGO_DB_NAME`, `AUTH_PORTLESS_EMAILS`. These names
+  `AUTH_MONGO_URI`, `AUTH_MONGO_DB_NAME`. These names
   match the source implementation verbatim, so an existing value copies
   straight across.
 - `app/config.py` (`ServiceSettings`, prefix `AUTHSVC_`) — **how** the
@@ -328,7 +321,7 @@ Not done as part of this extraction — this service is additive. When ready:
    ported here as `features.service.find_or_create_organization_for_deal`,
    but not yet exposed over HTTP (no route calls it). Add one if/when a
    remote caller needs it.
-3. `shared/auth/middleware.py`'s per-path allowlist (e.g. "non-Portless users
+3. `shared/auth/middleware.py`'s per-path allowlist (e.g. "non-staff users
    may reach `GET /deals`") is specific to the monolith's route layout, not
    ported here — that access rule belongs in whichever service owns
    `/deals`, checked against a token this service issued.

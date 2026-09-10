@@ -40,7 +40,6 @@ class UserPublic:
     email: str
     name: str
     org_id: str | None = None
-    is_portless: bool = False
     created_at: str | None = None
 
 
@@ -84,7 +83,6 @@ def _user_from_dict(d: dict[str, Any]) -> UserPublic:
         email=d["email"],
         name=d["name"],
         org_id=d.get("org_id"),
-        is_portless=d.get("is_portless", False),
         created_at=d.get("created_at"),
     )
 
@@ -200,7 +198,7 @@ class AuthServiceClient:
 
     async def delete_organization(self, token: str, org_id: str) -> None:
         """Raises AuthServiceError(409) if the organization still has member
-        users, or (403) for the reserved Guest/Portless organizations."""
+        users, or (403) for the reserved system organizations."""
         r = await self._client.delete(
             f"/auth/organizations/{org_id}", headers=self._auth_headers(token)
         )
