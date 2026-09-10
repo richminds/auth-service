@@ -1,15 +1,22 @@
 """Request/response models for the Auth service.
 
-One scope, not two. A user belongs to APP ACCOUNTS (``account_id`` plus
-``account_ids``) and nothing else — there is no separate organization or
-tenant field, and downstream services scope their data on the account.
+**One document per (email, account_id).** A stored user record belongs to
+exactly ONE app account — ``UserRecord.account_id``, a plain string. A person
+who works in two applications has TWO user records, one per account, each with
+its own ``user_id``, its own password hash, and its own display name. The
+uniqueness rule the ``users`` collection enforces is the PAIR: the same email
+may appear once per account and no more (see features/repository.py).
 
-**In responses, ``accounts`` carries all of it.** ``UserPublic`` deliberately
-does NOT repeat ``account_id``/``account_ids`` alongside it: those were three
-views of the same membership that could disagree, and a client had no way to
-tell which was authoritative. The one thing the flat fields said that the list
-did not — WHICH account this session is scoped to — is now ``selected`` on the
-list entry itself, so the list really is the whole story.
+Membership is therefore not stored as a list anywhere — it is DERIVED at
+request time by looking up every record sharing an email
+(features/service.py::accounts_for_email). That is what keeps the two facts
+from drifting: there is no array to fall out of step with the documents it
+claims to summarise, because the documents are the only copy.
+
+**In responses, ``accounts`` still carries all of it.** ``UserPublic`` is
+unchanged by the split on purpose — clients see the same ``accounts`` list
+with the same ``selected`` marker they saw when membership was an array, so
+nothing downstream has to know how it is stored.
 
 An ``account_id`` is a UUID (see features/account_ids.py), never a readable
 slug.
@@ -23,40 +30,66 @@ from pydantic import BaseModel, Field, field_validator
 
 
 class UserRecord(BaseModel):
-    """Stored user document (password is hashed, never returned).
+    """One stored user document — ONE person in ONE app account.
 
-    ``account_id`` ties the user to the APPLICATION they belong to — an app
-    account (see app_accounts.py). It is the only scope: membership of the
-    configured admin app account (``AUTH_ADMIN_ACCOUNT_ID``) is what
-    ``require_admin`` checks, and downstream services filter their data on the
-    same value.
+    ``account_id`` is the application this record belongs to, and it is
+    singular because the document is. A person in two applications has two of
+    these records: same email, different ``account_id``, different
+    ``user_id``, independent password hashes. The ``users`` collection
+    enforces that pair as unique, so an email can appear once per account and
+    never twice in the same one.
 
-    Documents written before the organization concept was removed may still
-    carry an ``org_id`` field; pydantic ignores unknown keys, so they load
-    unchanged and the value is simply no longer read.
+    **This replaced an ``account_ids`` array on a single per-email document.**
+    The array made one record answer for several applications, which meant
+    every membership change was a read-modify-write of a list, an account
+    could be present in the array while nothing in the account collection
+    matched it, and there was no way to give a person different credentials or
+    a different display name in two applications that do not otherwise trust
+    each other. Splitting the document makes membership a fact about which
+    documents exist, and Mongo enforces it with a unique index instead of
+    application code being careful.
+
+    Membership across accounts is not stored — it is derived per request by
+    querying the email (features/service.py::accounts_for_email), so there is
+    no second copy to keep in step.
+
+    Documents written before the split may still carry an ``account_ids``
+    array (and, older still, a flat ``org_id``); pydantic ignores unknown
+    keys, so they load, but their ``account_id`` is absent and they read as
+    belonging to no application. Split them with
+    scripts/migrate_user_account_split.py.
     """
 
     user_id: str
+    """Unique per DOCUMENT, not per person. The same human in two accounts has
+    two user_ids, and the token's ``sub`` is whichever one this session signed
+    in as — switching accounts issues a token for the other record."""
     email: str
+    """Lowercased on write. Shared across this person's records; it is the key
+    that ties them together, and the only one."""
     name: str
     password_hash: str
+    """Independent per record. Two accounts' credentials for one email may
+    diverge, and nothing here tries to keep them in step — see
+    features/service.py::login for how a login with no named account resolves
+    which record it is for."""
     account_id: str | None = None
-    account_ids: list[str] = Field(default_factory=list)
-    """Additional app accounts this user may sign in through, beyond
-    ``account_id`` (their primary/default one). A user who works across two
-    applications picks one at login — see service.effective_account_ids, which
-    is the single place the two fields are combined."""
+    """The ONE application this record belongs to. ``None`` means the record
+    belongs to no application yet; such a user can still sign in, they just
+    cannot claim an account. Optional rather than required so a record can be
+    created before an administrator assigns it."""
     created_at: datetime
 
 
 class UserPublic(BaseModel):
     """The user, as returned to clients and embedded in tokens.
 
-    Account membership appears exactly once, as ``accounts``. The flat
-    ``account_id``/``account_ids`` fields that used to sit beside it are gone:
-    they were the same membership expressed three ways, and nothing said which
-    copy won if they disagreed. The scoped account is now the entry with
-    ``selected`` set — see LoginAccount.
+    Deliberately UNCHANGED by the one-document-per-account split. Account
+    membership still appears exactly once, as ``accounts``, and the account
+    this session is scoped to is still the entry with ``selected`` set. The
+    list is now assembled from the caller's sibling records rather than read
+    off one record's array, but that is a storage detail and no client should
+    have to know it.
     """
 
     user_id: str
@@ -76,19 +109,32 @@ class UserPublic(BaseModel):
 
     @classmethod
     def from_record(
-        cls, r: UserRecord, accounts: list["LoginAccount"] | None = None
+        cls,
+        r: UserRecord,
+        accounts: list["LoginAccount"] | None = None,
+        scoped_account_id: str | None = None,
     ) -> "UserPublic":
         """Build the response for ``r``.
 
-        ``r.account_id`` is the SCOPED account (service._token_for copies the
-        record with the session's account before calling this), so it decides
-        both ``is_admin`` and which entry is marked ``selected``. Marking
-        happens here rather than in the caller so every path that returns a
-        user — login, register, switch, /auth/me — agrees on it.
+        ``scoped_account_id`` is the account THIS session is scoped to; it
+        decides both ``is_admin`` and which entry is marked ``selected``. It
+        defaults to the record's own ``account_id``, which is now the natural
+        answer: a record belongs to exactly one account, so the document the
+        caller authenticated as IS the scope. It stays a parameter because
+        callers that resolve a sibling record (account switching) already know
+        the answer and should not depend on which record they happened to
+        load.
+
+        ``accounts`` is passed in rather than queried here because building it
+        needs the repository, and this model deliberately does not reach for
+        one — see features/service.py::accounts_for_email.
+
+        Marking happens here rather than in each caller so every path that
+        returns a user — login, register, switch, /auth/me — agrees on it.
         """
         from .config import auth_settings
 
-        scoped = r.account_id
+        scoped = scoped_account_id or r.account_id
         marked = [
             a.model_copy(update={"selected": bool(scoped) and a.account_id == scoped})
             for a in (accounts or [])
@@ -152,10 +198,19 @@ class SelectAccountRequest(BaseModel):
 
 
 class AssignUserAccountsRequest(BaseModel):
-    account_id: str | None = Field(default=None, max_length=64)
-    """The user's primary/default app account."""
     account_ids: list[str] = Field(default_factory=list)
-    """Every additional app account the user may sign in through."""
+    """Every app account this user should be able to sign in through.
+
+    Still a list on the WIRE even though membership is no longer a list in
+    storage: this is a desired end state, and the service reconciles the
+    user's documents to match it — creating a record for an account they lack,
+    deleting the record for one that has been dropped (see
+    features/service.py::assign_user_accounts). Keeping the request shape
+    means the admin console's list editor round-trips unchanged.
+
+    Order sets the default: the FIRST entry is what a login naming no account
+    resolves to when several match. An empty list removes the user from every
+    application, which DELETES all of their records."""
 
 
 class TokenResponse(BaseModel):
@@ -218,11 +273,6 @@ class AppAccountRecord(BaseModel):
     See features/account_ids.py for how the value is produced — derived for
     accounts that predate this change so every environment agrees, random for
     ones registered afterwards."""
-    legacy_account_id: str = ""
-    """The slug this account used before IDs became UUIDs, kept for tracing a
-    migrated record back to its old identity and to make the backfill
-    (scripts/migrate_account_uuid.py) re-runnable. Never used to authenticate
-    or to scope data — it is not an alias for account_id."""
     name: str
     description: str = ""
     app_type: AppType = AppType.OTHER

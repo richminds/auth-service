@@ -10,6 +10,12 @@ by default the SAME shared database the calling application's monolith uses
 (see features/config.py), in its own `users` / `app_accounts` collections,
 plus a `revoked_tokens` collection (TTL-indexed) that the source
 implementation instead kept in a generic app-wide cache.
+
+**`users` is keyed on (email, account_id), not email.** One document is one
+person in one application, so the same email may appear once per account. The
+unique index is the compound pair; the old email-only unique index is DROPPED
+at startup if it is still there, because leaving it would silently forbid the
+second account and surface as a duplicate-key error nobody asked for.
 """
 from __future__ import annotations
 
@@ -28,15 +34,39 @@ _revocation_repository: "RevocationRepository | None" = None
 _app_account_repository: "AppAccountRepository | None" = None
 
 
+class DuplicateUserError(Exception):
+    """The (email, account_id) pair is already taken.
+
+    Raised by ``create`` so the service layer sees one exception whichever
+    backend is in play, rather than a pymongo DuplicateKeyError from one and a
+    ValueError from the other. Under the old email-only unique index this
+    condition was checked only in application code, so a race between two
+    registrations surfaced as an unhandled 500; now it is a typed error the
+    controller maps to 409.
+    """
+
+
 @runtime_checkable
 class UserRepository(Protocol):
-    async def get_by_email(self, email: str) -> UserRecord | None: ...
+    """User documents, keyed on (email, account_id).
+
+    ``get_by_email`` is deliberately absent: with one document per account an
+    email no longer identifies a single record, and a method that returned
+    "the" user for an email would have to pick one arbitrarily. Callers ask
+    either for every record sharing an email (``list_by_email``) or for the
+    one record in a named account (``get_by_email_account``), which forces the
+    ambiguity to be resolved at the call site where the answer is known.
+    """
+
+    async def list_by_email(self, email: str) -> list[UserRecord]: ...
+    async def get_by_email_account(
+        self, email: str, account_id: str | None
+    ) -> UserRecord | None: ...
     async def get_by_id(self, user_id: str) -> UserRecord | None: ...
     async def create(self, user: UserRecord) -> None: ...
+    async def delete_by_id(self, user_id: str) -> bool: ...
     async def list_all(self) -> list[UserRecord]: ...
-    async def update_accounts(
-        self, user_id: str, account_id: str | None, account_ids: list[str]
-    ) -> UserRecord | None: ...
+    async def update_account(self, user_id: str, account_id: str | None) -> UserRecord | None: ...
     async def update_password_hash(self, user_id: str, password_hash: str) -> None: ...
 
 
@@ -63,13 +93,30 @@ class AppAccountRepository(Protocol):
 # ---------------------------------------------------------------------------
 
 class InMemoryUserRepository:
+    """Process-local mirror of the Mongo behaviour, compound key included —
+    ``create`` raises DuplicateUserError on a repeated (email, account_id) so
+    tests exercise the same rejection the unique index performs in Mongo."""
+
     def __init__(self) -> None:
         self._by_id: dict[str, UserRecord] = {}
 
-    async def get_by_email(self, email: str) -> UserRecord | None:
+    @staticmethod
+    def _key(email: str, account_id: str | None) -> tuple[str, str | None]:
+        return (email.strip().lower(), account_id or None)
+
+    async def list_by_email(self, email: str) -> list[UserRecord]:
         key = email.strip().lower()
+        return sorted(
+            (u for u in self._by_id.values() if u.email.lower() == key),
+            key=lambda u: u.created_at,
+        )
+
+    async def get_by_email_account(
+        self, email: str, account_id: str | None
+    ) -> UserRecord | None:
+        want = self._key(email, account_id)
         for u in self._by_id.values():
-            if u.email.lower() == key:
+            if self._key(u.email, u.account_id) == want:
                 return u
         return None
 
@@ -77,20 +124,29 @@ class InMemoryUserRepository:
         return self._by_id.get(user_id)
 
     async def create(self, user: UserRecord) -> None:
+        if await self.get_by_email_account(user.email, user.account_id) is not None:
+            raise DuplicateUserError(
+                f"{user.email!r} already has a record in account {user.account_id!r}"
+            )
         self._by_id[user.user_id] = user
+
+    async def delete_by_id(self, user_id: str) -> bool:
+        return self._by_id.pop(user_id, None) is not None
 
     async def list_all(self) -> list[UserRecord]:
         return sorted(self._by_id.values(), key=lambda u: u.created_at)
 
-    async def update_accounts(
-        self, user_id: str, account_id: str | None, account_ids: list[str]
-    ) -> UserRecord | None:
+    async def update_account(self, user_id: str, account_id: str | None) -> UserRecord | None:
         user = self._by_id.get(user_id)
         if user is None:
             return None
-        updated = user.model_copy(
-            update={"account_id": account_id, "account_ids": list(account_ids)}
-        )
+        if account_id is not None:
+            clash = await self.get_by_email_account(user.email, account_id)
+            if clash is not None and clash.user_id != user_id:
+                raise DuplicateUserError(
+                    f"{user.email!r} already has a record in account {account_id!r}"
+                )
+        updated = user.model_copy(update={"account_id": account_id})
         self._by_id[user_id] = updated
         return updated
 
@@ -158,8 +214,37 @@ class MongoUserRepository:
     def __init__(self, col) -> None:
         self._col = col
 
-    async def get_by_email(self, email: str) -> UserRecord | None:
-        d = await self._col.find_one({"email": email.strip().lower()})
+    async def list_by_email(self, email: str) -> list[UserRecord]:
+        """Every record sharing an email, oldest first.
+
+        Oldest-first is load-bearing, not cosmetic: it is what makes "the
+        user's default account" a stable, derivable fact now that no array
+        holds the ordering. The first record created for an email is the one a
+        login naming no account resolves to.
+        """
+        cursor = self._col.find({"email": email.strip().lower()}).sort("created_at", 1)
+        docs = await cursor.to_list(length=1_000)
+        out: list[UserRecord] = []
+        for d in docs:
+            d.pop("_id", None)
+            try:
+                out.append(UserRecord(**d))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Skipping malformed user document: %s", exc)
+        return out
+
+    async def get_by_email_account(
+        self, email: str, account_id: str | None
+    ) -> UserRecord | None:
+        # A record with no account is stored with account_id absent OR null
+        # depending on when it was written, so match both rather than only the
+        # shape this version happens to produce.
+        criteria: dict = {"email": email.strip().lower()}
+        if account_id:
+            criteria["account_id"] = account_id
+        else:
+            criteria["$or"] = [{"account_id": None}, {"account_id": {"$exists": False}}]
+        d = await self._col.find_one(criteria)
         if d is None:
             return None
         d.pop("_id", None)
@@ -175,7 +260,49 @@ class MongoUserRepository:
     async def create(self, user: UserRecord) -> None:
         doc = user.model_dump(mode="json")
         doc["email"] = doc["email"].strip().lower()
-        await self._col.insert_one(doc)
+        try:
+            await self._col.insert_one(doc)
+        except Exception as exc:  # noqa: BLE001
+            # The unique (email, account_id) index is the authority, not the
+            # service's prior existence check — two concurrent registrations
+            # both pass that check and one of them lands here. Translating it
+            # keeps that race a 409 instead of the 500 it used to be.
+            from pymongo.errors import DuplicateKeyError
+
+            if isinstance(exc, DuplicateKeyError):
+                raise DuplicateUserError(
+                    f"{user.email!r} already has a record in account {user.account_id!r}"
+                ) from exc
+            raise
+
+    async def delete_by_id(self, user_id: str) -> bool:
+        result = await self._col.delete_one({"user_id": user_id})
+        return result.deleted_count > 0
+
+    async def update_account(self, user_id: str, account_id: str | None) -> UserRecord | None:
+        """Move one record to a different application.
+
+        Also clears any leftover ``account_ids`` array, so a record written
+        before the split cannot keep a stale membership list beside the field
+        that now decides everything.
+        """
+        from pymongo import ReturnDocument
+        from pymongo.errors import DuplicateKeyError
+
+        try:
+            d = await self._col.find_one_and_update(
+                {"user_id": user_id},
+                {"$set": {"account_id": account_id}, "$unset": {"account_ids": ""}},
+                return_document=ReturnDocument.AFTER,
+            )
+        except DuplicateKeyError as exc:
+            raise DuplicateUserError(
+                f"a record already exists in account {account_id!r} for this email"
+            ) from exc
+        if d is None:
+            return None
+        d.pop("_id", None)
+        return UserRecord(**d)
 
     async def list_all(self) -> list[UserRecord]:
         cursor = self._col.find({}).sort("created_at", 1)
@@ -188,21 +315,6 @@ class MongoUserRepository:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Skipping malformed user document: %s", exc)
         return users
-
-    async def update_accounts(
-        self, user_id: str, account_id: str | None, account_ids: list[str]
-    ) -> UserRecord | None:
-        from pymongo import ReturnDocument
-
-        d = await self._col.find_one_and_update(
-            {"user_id": user_id},
-            {"$set": {"account_id": account_id, "account_ids": list(account_ids)}},
-            return_document=ReturnDocument.AFTER,
-        )
-        if d is None:
-            return None
-        d.pop("_id", None)
-        return UserRecord(**d)
 
     async def update_password_hash(self, user_id: str, password_hash: str) -> None:
         await self._col.update_one(
@@ -301,6 +413,52 @@ class MongoRevocationRepository:
 # Lifecycle
 # ---------------------------------------------------------------------------
 
+async def _ensure_user_indexes(col, ascending, index_model) -> None:
+    """Put the `users` collection on the (email, account_id) unique key.
+
+    Two steps, and the order matters. The email-only unique index has to go
+    FIRST: while it exists, a second record for the same email in a different
+    account is rejected by the server, which is precisely the thing this
+    version exists to allow. Creating the compound index without dropping the
+    old one would leave the stricter rule in force and the change would look
+    like it silently did nothing.
+
+    Dropping is best-effort and idempotent — a fresh deployment has no such
+    index, and a second process may have dropped it a moment ago. Neither is
+    an error worth failing startup over, so both are swallowed; anything else
+    is logged and re-raised, because a users collection whose constraints we
+    could not establish is not something to start serving on.
+
+    The compound index is created after, and is itself the enforcement: it
+    rejects a repeat of a pair even when two registrations race past the
+    service's existence check. `account_id` is nullable, and Mongo indexes a
+    missing field as null, so a user who belongs to no application yet is
+    still limited to one such record per email — which is what we want.
+    """
+    from pymongo.errors import OperationFailure
+
+    try:
+        await col.drop_index("email_unique")
+        logger.info(
+            "Auth: dropped the legacy email-only unique index — users are now "
+            "keyed on (email, account_id), so one email may exist once per account."
+        )
+    except OperationFailure as exc:
+        # IndexNotFound (27) / NamespaceNotFound (26): nothing to drop.
+        if exc.code not in (26, 27):
+            logger.error("Auth: could not drop the legacy email_unique index: %s", exc)
+            raise
+
+    await col.create_indexes([
+        index_model([("user_id", ascending)], unique=True, name="user_id_unique"),
+        index_model(
+            [("email", ascending), ("account_id", ascending)],
+            unique=True,
+            name="email_account_unique",
+        ),
+    ])
+
+
 async def init_repository() -> None:
     """Initialise the process-wide repositories. Idempotent-ish: safe to call
     once at startup; falls back to in-memory storage on any Mongo failure."""
@@ -324,10 +482,7 @@ async def init_repository() -> None:
         conn = await get_connection()
 
         users_col = conn.get_collection(auth_settings.users_collection)
-        await users_col.create_indexes([
-            IndexModel([("user_id", ASCENDING)], unique=True, name="user_id_unique"),
-            IndexModel([("email", ASCENDING)], unique=True, name="email_unique"),
-        ])
+        await _ensure_user_indexes(users_col, ASCENDING, IndexModel)
         _user_repository = MongoUserRepository(users_col)
 
         revoked_col = conn.get_collection(auth_settings.revoked_tokens_collection)

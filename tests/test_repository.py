@@ -28,10 +28,39 @@ async def test_create_and_get_by_id():
     assert found.email == "a@b.com"
 
 
-async def test_get_by_email_is_case_insensitive():
+async def test_lookup_by_email_is_case_insensitive():
     repo = InMemoryUserRepository()
     await repo.create(_user(email="A@B.com"))
-    assert (await repo.get_by_email("a@b.com")) is not None
+    assert (await repo.get_by_email_account("a@b.com", None)) is not None
+    assert len(await repo.list_by_email("a@b.com")) == 1
+
+
+async def test_the_same_email_may_hold_one_record_per_account():
+    """The whole point of the split — and the pair is still unique."""
+    repo = InMemoryUserRepository()
+    await repo.create(_user("USR-1", "a@b.com").model_copy(update={"account_id": "acct-a"}))
+    await repo.create(_user("USR-2", "a@b.com").model_copy(update={"account_id": "acct-b"}))
+
+    assert len(await repo.list_by_email("a@b.com")) == 2
+    a = await repo.get_by_email_account("a@b.com", "acct-a")
+    b = await repo.get_by_email_account("a@b.com", "acct-b")
+    assert (a.user_id, b.user_id) == ("USR-1", "USR-2")
+    # Different records, so credentials really are independent.
+    await repo.update_password_hash("USR-2", "changed")
+    assert (await repo.get_by_id("USR-1")).password_hash == "x"
+
+
+async def test_repeating_an_email_in_one_account_is_rejected():
+    """In-memory mirrors what the compound unique index does in Mongo, so the
+    duplicate path is exercised without a database."""
+    import pytest
+
+    from features.repository import DuplicateUserError
+
+    repo = InMemoryUserRepository()
+    await repo.create(_user("USR-1", "a@b.com").model_copy(update={"account_id": "acct-a"}))
+    with pytest.raises(DuplicateUserError):
+        await repo.create(_user("USR-2", "A@B.com").model_copy(update={"account_id": "acct-a"}))
 
 
 async def test_get_by_id_miss_returns_none():

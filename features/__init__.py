@@ -2,10 +2,12 @@
 
 Portable core, importable in-process or served over HTTP (see ``app/``).
 
-A user's only scope is the APP ACCOUNT they belong to (``account_id``, plus
-``account_ids`` for anyone who works across several). There is no organization
-or tenant concept: downstream services filter their data on the account, and
-administration is gated on membership of the configured admin app account.
+A user's only scope is the APP ACCOUNT they belong to (``account_id``), and a
+stored user record covers exactly ONE account — the same email in two
+applications is two records, keyed unique on (email, account_id). There is no
+organization or tenant concept: downstream services filter their data on the
+account, and administration is gated on holding a record in the configured
+admin app account.
 
 Quick start::
 
@@ -27,6 +29,7 @@ from .blacklist import is_token_revoked, revoke_token
 from .config import AuthSettings, auth_settings
 from .dependencies import AuthUser, get_current_user, require_admin
 from .repository import (
+    DuplicateUserError,
     InMemoryRevocationRepository,
     InMemoryUserRepository,
     RevocationRepository,
@@ -57,7 +60,7 @@ from .service import (
     InvalidEmailError,
     UserNotFoundError,
     assign_user_accounts,
-    effective_account_ids,
+    accounts_for_email,
     get_user,
     list_users,
     login,
@@ -107,6 +110,7 @@ __all__ = [
     "AppAccountNotFoundError",
     # repository
     "UserRepository",
+    "DuplicateUserError",
     "RevocationRepository",
     "InMemoryUserRepository",
     "InMemoryRevocationRepository",
@@ -122,7 +126,7 @@ __all__ = [
     "get_user",
     "list_users",
     "assign_user_accounts",
-    "effective_account_ids",
+    "accounts_for_email",
     "EmailTakenError",
     "InvalidEmailError",
     "InvalidCredentialsError",

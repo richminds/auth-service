@@ -16,7 +16,8 @@ script runs:
 WHAT IT TOUCHES (three databases, five collections)
 
   auth-service      app_accounts   account_id            -> uuid
-                    users          account_id/account_ids -> uuid
+                    users          account_id (and any legacy
+                                   account_ids array)    -> uuid
   knowledge-service chunks         metadata.account_id   -> uuid
                     parent_docs    metadata.account_id   -> uuid
                     graph_chunks   metadata.account_id   -> uuid
@@ -145,23 +146,36 @@ async def migrate_app_accounts(auth_db, mapping: dict[str, str], plan: Plan, app
             plan.add(f"app_accounts: drop superseded slug record {slug!r}", 1)
             if apply:
                 await col.delete_one({"account_id": slug})
-                await col.update_one(
-                    {"account_id": new_id},
-                    {"$set": {"legacy_account_id": slug}},
-                )
             continue
 
         plan.add(f"app_accounts: {slug!r} -> {new_id}", 1)
         if apply:
+            # The old slug is NOT recorded on the migrated document: an account
+            # is its UUID and its name, and keeping the slug invited treating
+            # it as a second identifier.
             await col.update_one(
                 {"account_id": slug},
-                {"$set": {"account_id": new_id, "legacy_account_id": slug}},
+                {"$set": {"account_id": new_id}, "$unset": {"legacy_account_id": ""}},
             )
 
 
 async def migrate_users(auth_db, mapping: dict[str, str], plan: Plan, apply: bool) -> None:
+    """Rewrite slugs to UUIDs wherever a user record names an account.
+
+    This script only changes the VALUE of an account id, never the shape of the
+    record. A user document holds its account in a flat ``account_id`` (one
+    record per account — features/schemas.py), and records written before that
+    split may still hold an ``account_ids`` array; both are rewritten in place
+    so this can run on a database in either shape.
+
+    Turning an array record into per-account records is a different job with
+    different consequences (it creates and deletes documents), and it lives in
+    scripts/migrate_user_account_split.py. Run this one first so the split
+    script sees UUIDs everywhere, then that one.
+    """
     col = auth_db["users"]
     for slug, new_id in mapping.items():
+        # The flat field — the shape the service writes today.
         n = await col.count_documents({"account_id": slug})
         if n:
             plan.add(f"users.account_id: {slug!r} -> {new_id}", n)
@@ -170,18 +184,25 @@ async def migrate_users(auth_db, mapping: dict[str, str], plan: Plan, apply: boo
                     {"account_id": slug}, {"$set": {"account_id": new_id}}
                 )
 
-        # account_ids is an array; positional $ updates one match at a time, so
-        # loop until none remain rather than assuming a single occurrence.
+        # Pre-split records that still carry the array. Rewritten so the split
+        # script has a UUID to work from; `$` updates the first match, so loop
+        # until none are left rather than assuming one entry per document.
         while True:
             n = await col.count_documents({"account_ids": slug})
             if not n:
                 break
-            plan.add(f"users.account_ids: {slug!r} -> {new_id}", n)
+            plan.add(f"users.account_ids[]: {slug!r} -> {new_id}", n)
             if not apply:
                 break
-            await col.update_many(
-                {"account_ids": slug}, {"$set": {"account_ids.$": new_id}}
-            )
+            await col.update_many({"account_ids": slug}, {"$set": {"account_ids.$": new_id}})
+
+    remaining = await col.count_documents({"account_ids": {"$exists": True}})
+    if remaining:
+        plan.add(
+            "users still holding an account_ids array "
+            "(run migrate_user_account_split.py next)",
+            0,
+        )
 
 
 async def migrate_metadata(db, collections, mapping, plan, apply, label) -> None:

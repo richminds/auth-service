@@ -112,18 +112,48 @@ Two deliberate looseness's remain, both so nothing breaks mid-migration:
 Once every application is registered and every user has an `account_id`, both
 can be tightened — see [Making `account_id` mandatory](#making-account_id-mandatory).
 
-The response's top-level `account_id` is the application this token is scoped
+The token's `account_id` claim is the application this token is scoped
 to — downstream services (knowledge-service) read it from the verified token
 and scope their data on it, so it's baked into the JWT claims rather than a
 header the caller can spoof.
 
 ### Users who belong to more than one application
 
-A user can work across several applications. Staff set this with
-`PATCH /auth/users/{id}/accounts` — `account_id` is their **default** (what a
-login that names no account gets) and `account_ids` lists the **extras**; the
-two are combined by `features/service.py::effective_account_ids`, the single
-place membership is decided.
+**One user document is one person in ONE application.** The `users` collection
+is keyed unique on the pair `(email, account_id)`, so the same email in two
+applications is two records — each with its own `user_id`, its own
+`password_hash`, and its own display name. Registering an email that already
+exists in a *different* application is not a conflict; 409 is returned only for
+the same email in the same application.
+
+Membership is therefore never stored as a list. "Which applications is this
+person in" is derived per request by querying the email —
+`features/service.py::accounts_for_email`, the single place membership is
+decided. There is no array to fall out of step with the documents it claims to
+summarise, and Mongo enforces the rule with an index instead of application
+code being careful.
+
+What that costs is that an email no longer names one record, so every entry
+point says which record it means:
+
+| Call | How the record is resolved |
+| --- | --- |
+| `POST /auth/login` with `account_id` | the record in that account, and only that one |
+| `POST /auth/login` without one | the email's records oldest-first; the first whose password verifies |
+| `POST /auth/me/account` | the caller's sibling record for the target account — **the new token's `sub` changes** |
+| `PATCH /auth/users/{id}/accounts` | every record sharing that user's email |
+
+Because the hashes are independent, a login that names no account tries each
+record rather than only the oldest — otherwise a correct password for a newer
+account would be rejected. That is one bcrypt per record the email holds.
+
+Staff still set membership with `PATCH /auth/users/{id}/accounts`, sending one
+ordered list. The list is a desired **end state** the service reconciles the
+person's documents to: an account they lack gets a record (a record with no
+account is reused first, otherwise one is cloned with the same name and
+password hash); an account dropped from the list has its record **deleted**,
+credentials and all. An empty list does not delete the person — one record is
+kept, belonging to no application.
 
 `POST /auth/login` therefore returns an `accounts` array — every application
 the verified user may sign in through, each `{account_id, name}` — **only after
@@ -143,14 +173,32 @@ account is a signed claim the downstream services filter on — see
 A disabled application is dropped from the `accounts` list, so a user is never
 offered one they can't actually use.
 
+#### Migrating a database written before the split
+
+Records written when membership was an `account_ids` array still load —
+pydantic ignores unknown keys — but their `account_id` is absent, so they read
+as belonging to **no application**: the person signs in, finds an empty account
+picker, and silently loses admin rights. Two scripts, in this order, both
+dry-run by default:
+
+```bash
+python scripts/migrate_account_uuid.py            # slugs -> UUIDs (if needed)
+python scripts/migrate_user_account_split.py      # arrays -> per-account records
+```
+
+The split keeps the first account on the original document — preserving the
+`user_id` that existing tokens and downstream rows are keyed on — and clones a
+new record for each further account. It also drops the old email-only unique
+index, which would otherwise reject the second record; the service drops it at
+startup too, so the two can be run in either order.
+
 ### Making `account_id` mandatory
 
 Not done yet, and the order matters:
 
 1. Register every application in [account-management-ui](../account-management-ui).
 2. Backfill each user's applications with `PATCH /auth/users/{id}/accounts`
-   (`account_id` for the default, `account_ids` for anyone who works across
-   several).
+   (one ordered list; the first entry is their default).
 3. Update each app to send its `account_id` at login.
 4. Only then make the field required and drop the two allowances above.
 

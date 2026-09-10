@@ -79,6 +79,10 @@ async def assert_login_allowed(account_id: str) -> None:
 async def _ensure_account(
     account_id: str, slug: str, name: str, description: str, app_type: AppType
 ) -> AppAccountRecord:
+    # `slug` is used only for the log line and to document where the derived
+    # ID came from — it is NOT stored. An account is its UUID and its name;
+    # keeping the old slug on the record invited it being treated as a second
+    # identifier, which is exactly what moving to UUIDs was meant to end.
     """Idempotently ensure one well-known app account exists.
 
     Both bootstrapped accounts have IDs that are DERIVED rather than minted
@@ -94,7 +98,6 @@ async def _ensure_account(
 
     account = AppAccountRecord(
         account_id=account_id,
-        legacy_account_id=slug,
         name=name,
         description=description,
         app_type=app_type,

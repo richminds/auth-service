@@ -10,15 +10,21 @@ the data is otherwise sound; this one starts over.
 WHAT IT DOES
 
   1. DELETES every document in ``app_accounts`` and ``users``.
-  2. Creates the two well-known accounts, with IDs DERIVED from their slugs
-     (features/account_ids.py) rather than minted, so they match
-     ``AUTH_ADMIN_ACCOUNT_ID``, the admin console's hardcoded constant, and the
-     knowledge console's sign-up target:
+  2. Creates the RichMinds admin account, with an ID DERIVED from its slug
+     (features/account_ids.py) rather than minted, so it matches
+     ``AUTH_ADMIN_ACCOUNT_ID`` and the admin console's hardcoded constant:
 
        RichMinds  328dc8a2-c30c-5715-920f-21b963b5ce39  (admin)
-       Guest      1990b268-3b12-50ab-9be3-09970c1bcfc8  (guest sign-ups)
 
-  3. Creates the seed administrator as a member of RichMinds.
+     The Guest account is deliberately NOT seeded here — the service creates it
+     at startup (``ensure_guest_account``), which is what keeps the knowledge
+     console's public sign-up working on a deployment nobody has seeded.
+
+  3. Creates the seed administrator as ONE user record in RichMinds.
+
+     A user record is one person in one application (features/schemas.py), so
+     this seeds exactly one document. Giving that email a second application
+     later adds a second record rather than editing this one.
 
 WHAT IT DESTROYS
 
@@ -46,10 +52,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
-from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlsplit
-from uuid import uuid4
 
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT))
@@ -61,35 +65,21 @@ try:
 except ImportError:  # pragma: no cover — ships with pydantic-settings
     pass
 
-from features.account_ids import (  # noqa: E402
-    ADMIN_ACCOUNT_SLUG,
-    ADMIN_ACCOUNT_UUID,
-    GUEST_ACCOUNT_SLUG,
-    GUEST_ACCOUNT_UUID,
-)
+from features import service  # noqa: E402
+from features.account_ids import ADMIN_ACCOUNT_UUID  # noqa: E402
+from features.app_accounts import ensure_admin_account  # noqa: E402
 from features.config import auth_settings  # noqa: E402
-from features.security import hash_password  # noqa: E402
+from features.repository import (  # noqa: E402
+    close_repository,
+    get_app_account_repository,
+    get_repository,
+    init_repository,
+)
+from features.schemas import RegisterRequest  # noqa: E402
 
 DEFAULT_ADMIN_EMAIL = "richminds84@gmail.com"
 DEFAULT_ADMIN_NAME = "Rich Minds"
 DEFAULT_ADMIN_PASSWORD = "kkkkkkkk"
-
-ACCOUNTS = [
-    {
-        "account_id": ADMIN_ACCOUNT_UUID,
-        "legacy_account_id": ADMIN_ACCOUNT_SLUG,
-        "name": "RichMinds",
-        "description": "Maintains all the app accounts.",
-        "app_type": "admin",
-    },
-    {
-        "account_id": GUEST_ACCOUNT_UUID,
-        "legacy_account_id": GUEST_ACCOUNT_SLUG,
-        "name": "Guest",
-        "description": "Maintains all the Guest user for knowledge service.",
-        "app_type": "service",
-    },
-]
 
 
 def _safe_host(uri: str) -> str:
@@ -100,12 +90,6 @@ def _safe_host(uri: str) -> str:
         return urlsplit(uri).netloc.rsplit("@", 1)[-1] or "(unparseable)"
     except Exception:  # noqa: BLE001
         return "(unparseable)"
-
-
-def _new_user_id() -> str:
-    """Same shape service._new_user_id produces, so seeded users are
-    indistinguishable from registered ones."""
-    return f"USR-{uuid4().hex[:12].upper()}"
 
 
 async def main() -> int:
@@ -142,27 +126,37 @@ async def main() -> int:
     print(f"\n  Mode:     {mode}")
     print(f"  Target:   {_safe_host(auth_settings.mongo_uri)} / {auth_settings.mongo_db_name}\n")
 
+    # The repositories the service itself uses, pointed at the same database.
+    await init_repository()
+
+    # init_repository() falls back to in-memory storage on ANY Mongo failure,
+    # and says so only in a log line. For the service that is a reasonable
+    # degradation; for this script it would be silent data loss — it would
+    # report nothing to delete, seed into a dict, print "Done", and exit 0
+    # having written nothing at all. Fail instead.
+    from features.repository import InMemoryUserRepository
+
+    if isinstance(get_repository(), InMemoryUserRepository):
+        print(
+            "Repository fell back to IN-MEMORY storage — Mongo is unreachable or "
+            "misconfigured. Nothing was written. Check AUTH_MONGO_URI.",
+            file=sys.stderr,
+        )
+        await close_repository()
+        return 2
+
     client = AsyncIOMotorClient(auth_settings.mongo_uri)
     try:
-        db = client[auth_settings.mongo_db_name]
-        accounts_col = db[auth_settings.app_accounts_collection]
-        users_col = db[auth_settings.users_collection]
+        existing_users = await get_repository().list_all()
+        existing_accounts = await get_app_account_repository().list_all()
 
-        existing_accounts = await accounts_col.count_documents({})
-        existing_users = [
-            u async for u in users_col.find({}, {"_id": 0, "email": 1, "account_id": 1})
-        ]
-
-        print(f"  DELETE  {existing_accounts} app account(s)")
+        print(f"  DELETE  {len(existing_accounts)} app account(s)")
         print(f"  DELETE  {len(existing_users)} user(s):")
         for u in existing_users:
-            print(f"            {u.get('email', '(no email)')}")
+            print(f"            {u.email}")
         print()
-        print("  CREATE  accounts:")
-        for a in ACCOUNTS:
-            print(f"            {a['name']:<10} {a['account_id']}  — {a['description']}")
-        print("  CREATE  user:")
-        print(f"            {email} ({args.name}) in RichMinds, is_admin=True")
+        print(f"  CREATE  account: RichMinds  {ADMIN_ACCOUNT_UUID}")
+        print(f"  CREATE  user:    {email} ({args.name}) in RichMinds, is_admin=True")
         print()
 
         if not args.apply:
@@ -176,41 +170,46 @@ async def main() -> int:
                 return 1
             print()
 
-        await accounts_col.delete_many({})
-        await users_col.delete_many({})
+        # Wipe. This is the one thing with no service-level equivalent — the
+        # service has no "delete everything" operation, and should not.
+        db = client[auth_settings.mongo_db_name]
+        await db[auth_settings.app_accounts_collection].delete_many({})
+        await db[auth_settings.users_collection].delete_many({})
 
-        now = datetime.now(UTC)
-        await accounts_col.insert_many(
-            [
-                {
-                    **a,
-                    "app_url": "",
-                    "enabled": True,
-                    "created_by": "system:reset",
-                    "created_at": now,
-                    "updated_at": None,
-                }
-                for a in ACCOUNTS
-            ]
-        )
-        user_id = _new_user_id()
-        await users_col.insert_one(
-            {
-                "user_id": user_id,
-                "email": email,
-                "name": args.name.strip(),
-                "password_hash": hash_password(args.password),
-                "account_id": ADMIN_ACCOUNT_UUID,
-                "account_ids": [],
-                "created_at": now,
-            }
+        # ── Create through the service's OWN code paths ───────────────────
+        # Not hand-written documents. This script used to insert_many() its own
+        # dicts, which meant the seeded records could drift from what the
+        # running service produces — and did, twice: they carried a
+        # legacy_account_id the service no longer writes, and they wrote
+        # membership in whichever shape was current when the script was last
+        # touched. Going through ensure_admin_account() and service.register()
+        # makes that class of bug impossible: whatever the service creates at
+        # runtime is exactly what this script creates, including the
+        # one-record-per-account shape.
+        account = await ensure_admin_account()
+
+        # register() is the real registration path — same validation, same
+        # password hashing, same UserRecord shape. Self-registration into the
+        # admin account is allowed exactly once per store (service.register),
+        # and the wipe above just made this that once.
+        token = await service.register(
+            RegisterRequest(
+                email=email,
+                name=args.name.strip(),
+                password=args.password,
+                account_id=account.account_id,
+            )
         )
 
-        print(f"  Done. Seeded {user_id} ({email}) as an administrator.")
+        user = token.user
+        print(f"  Done. Seeded {user.user_id} ({user.email}) as an administrator.")
+        print(f"        account:  {account.name} ({account.account_id})")
+        print(f"        is_admin: {user.is_admin}")
         print("  Sign in to the admin console with the password you passed.\n")
         return 0
     finally:
         client.close()
+        await close_repository()
 
 
 if __name__ == "__main__":

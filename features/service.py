@@ -3,6 +3,20 @@
 A user's only scope is the APP ACCOUNT they belong to. There is no separate
 organization or tenant: downstream services filter their data on
 ``account_id``, which travels in the token.
+
+**A user record is one person in one account.** The same email in two
+applications is two records (features/schemas.py::UserRecord), so "which
+accounts does this person have" is not a stored field — it is a query on the
+email, and every function here that needs it goes through
+``accounts_for_email``. Keeping that one derivation is what stops the answer
+from differing between login, /auth/me, the account switcher and the admin
+console's user list.
+
+The cost of the split is that an email no longer names a single record, so
+every entry point has to say WHICH record it means. Login resolves it from
+the named account, or by trying the email's records when none is named;
+account switching resolves the sibling record for the target account; and the
+token's ``sub`` is always the specific record the caller authenticated as.
 """
 from __future__ import annotations
 
@@ -12,7 +26,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from .blacklist import revoke_token
-from .repository import get_repository
+from .repository import DuplicateUserError, get_repository
 from .schemas import (
     LoginAccount,
     LoginRequest,
@@ -33,9 +47,21 @@ logger = logging.getLogger(__name__)
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
+# A real bcrypt hash of a value nothing can supply, used to spend the same time
+# on an unknown email as on a wrong password. Computed once at import: hashing
+# per failed login would itself be a timing signal, and a cheap placeholder
+# would not match the cost of the verify it stands in for.
+_DUMMY_HASH = hash_password("not-a-password-" + uuid4().hex)
+
 
 class EmailTakenError(Exception):
-    """Raised when registering an email that already exists (409)."""
+    """Raised when registering an email that already exists IN THAT ACCOUNT (409).
+
+    Scoped to the account, not global: the same email registering into a
+    different application is the supported case now, not a conflict. Also
+    raised when the unique index rejects a pair that two concurrent
+    registrations both believed was free.
+    """
 
 
 class InvalidEmailError(Exception):
@@ -86,6 +112,9 @@ def _token_for(
     account_id: str | None = None,
     accounts: list[LoginAccount] | None = None,
 ) -> TokenResponse:
+    # Defaults to the record's OWN account: a record belongs to exactly one
+    # application, so the document the caller authenticated as is the scope.
+    # Callers that resolved a sibling record pass the account explicitly.
     scoped_account_id = account_id or user.account_id
     token = create_access_token(
         subject=user.user_id,
@@ -110,64 +139,90 @@ def _token_for(
             "role": _role_for(scoped_account_id),
         },
     )
-    # from_record reads the SCOPED account off the record to decide is_admin
-    # and to mark the selected entry in `accounts`, so hand it a copy carrying
-    # this session's account rather than the user's stored default.
-    scoped = user.model_copy(update={"account_id": scoped_account_id})
+    # The scoped account is a property of this token, not of the user record,
+    # so it is passed to from_record rather than written onto a copy of the
+    # record — which is what the old flat account_id field forced.
     return TokenResponse(
         access_token=token,
-        user=UserPublic.from_record(scoped, accounts=accounts),
+        user=UserPublic.from_record(
+            user, accounts=accounts, scoped_account_id=scoped_account_id
+        ),
     )
 
 
-def effective_account_ids(user: UserRecord) -> list[str]:
-    """Every app account ``user`` may sign in through, primary one first.
+async def accounts_for_email(email: str) -> list[UserRecord]:
+    """Every user record sharing ``email``, oldest first.
 
-    The single place ``account_id`` (primary) and ``account_ids`` (additional)
-    are combined, so membership means the same thing at login, at account
-    switch, and in the list offered to the client.
+    The single derivation of "which applications is this person in". Membership
+    used to be an array on one document; it is now the set of documents that
+    exist, so this query IS the membership and there is no stored copy that can
+    disagree with it.
+
+    Oldest first because the ordering has to come from somewhere and creation
+    order is the only thing left once the array is gone: the first record made
+    for an email is that person's default account, which is what a login naming
+    no account resolves to.
     """
-    ordered = [user.account_id, *user.account_ids]
-    seen: list[str] = []
-    for account_id in ordered:
-        if account_id and account_id not in seen:
-            seen.append(account_id)
-    return seen
+    return await get_repository().list_by_email(email.strip().lower())
 
 
-async def _login_accounts(account_ids: list[str]) -> list[LoginAccount]:
+async def _login_accounts(records: list[UserRecord]) -> list[LoginAccount]:
     """Resolve display names for the accounts offered at login.
 
-    An ID with no app-account record (registered before the collection
-    existed) still appears, named after itself — dropping it would lock the
-    user out of the only account they have.
+    Takes the records rather than a list of IDs because the records are now
+    where membership lives — passing IDs would mean a caller had already
+    flattened them and could pass a set that no document backs.
+
+    A record whose account has no app-account entry (registered before the
+    collection existed) still appears, named after itself: dropping it would
+    lock the user out of the only account they have. A record whose account is
+    DISABLED is dropped — that is what disabling is for.
+
+    A record with no account at all contributes no entry; the user can sign in,
+    they just have nothing to select.
     """
     from .repository import get_app_account_repository
 
     repo = get_app_account_repository()
     out: list[LoginAccount] = []
-    for account_id in account_ids:
-        record = await repo.get(account_id)
-        if record is not None and not record.enabled:
+    seen: set[str] = set()
+    for record in records:
+        account_id = record.account_id
+        if not account_id or account_id in seen:
             continue
-        out.append(LoginAccount(account_id=account_id, name=record.name if record else account_id))
+        account = await repo.get(account_id)
+        if account is not None and not account.enabled:
+            continue
+        seen.add(account_id)
+        out.append(
+            LoginAccount(account_id=account_id, name=account.name if account else account_id)
+        )
     return out
 
 
 async def register(req: RegisterRequest) -> TokenResponse:
-    """Register a new user.
+    """Register a user INTO ONE APPLICATION.
 
-    ``req.account_id`` is the only scope a user has. It is optional — a user
-    created without one belongs to no application yet and can be assigned to
-    one later by an administrator (see assign_user_accounts).
+    ``req.account_id`` is the only scope a user has, and it is now the scope of
+    the DOCUMENT: registering an email that already exists in a different
+    application creates a second, independent record rather than failing. That
+    is the point of the split — the same person can hold an account in two
+    applications that do not otherwise trust each other, with separate
+    credentials.
+
+    What is still refused is the same email twice in the SAME application.
     """
     email = req.email.strip().lower()
     if not _EMAIL_RE.match(email):
         raise InvalidEmailError(f"{req.email!r} is not a valid email address")
 
     repo = get_repository()
-    if await repo.get_by_email(email) is not None:
-        raise EmailTakenError(f"An account with {email!r} already exists")
+    # Scoped to the account, not the email. The unique (email, account_id)
+    # index is the real authority — this check only turns the common case into
+    # a clean 409 without a round trip through a driver exception.
+    if await repo.get_by_email_account(email, req.account_id) is not None:
+        where = f"in application {req.account_id!r}" if req.account_id else "with no application"
+        raise EmailTakenError(f"{email!r} already has an account {where}")
 
     # The application the user belongs to. Validated so a typo can't quietly
     # create a user tied to an application that doesn't exist — including a
@@ -186,6 +241,10 @@ async def register(req: RegisterRequest) -> TokenResponse:
         # deployment; after that the account is closed to self-registration and
         # further admins have to be made deliberately. Without this, anyone who
         # knows the admin account_id could sign up as an administrator.
+        #
+        # "Is there an admin already" is now simply "does a record exist in the
+        # admin account" — one property of one document, where it used to mean
+        # scanning every user's membership array.
         if req.account_id == auth_settings.admin_account_id:
             existing_admins = [
                 u for u in await repo.list_all() if u.account_id == auth_settings.admin_account_id
@@ -205,51 +264,79 @@ async def register(req: RegisterRequest) -> TokenResponse:
         email=email,
         name=req.name.strip(),
         password_hash=hash_password(req.password),
-        account_id=req.account_id,
+        # Singular: this document is this person in this one application.
+        account_id=req.account_id or None,
         created_at=datetime.now(timezone.utc),
     )
-    await repo.create(user)
+    try:
+        await repo.create(user)
+    except DuplicateUserError as exc:
+        # Lost a race with a concurrent registration of the same pair. The
+        # index caught it; report the same 409 the pre-check would have.
+        raise EmailTakenError(str(exc)) from exc
+
     logger.info(
         "Auth: registered user %s (%s) account=%s", user.user_id, email, req.account_id
     )
-    return _token_for(user, accounts=await _login_accounts(effective_account_ids(user)))
+    # The person's OTHER accounts are included: registering a second account
+    # for an existing email should show them both, the same as a login would.
+    return _token_for(user, accounts=await _login_accounts(await accounts_for_email(email)))
 
 
 async def login(req: LoginRequest) -> TokenResponse:
-    repo = get_repository()
-    user = await repo.get_by_email(req.email.strip().lower())
-    # Always run verify to keep timing roughly constant whether or not the user exists.
-    if user is None or not verify_password(req.password, user.password_hash):
-        raise InvalidCredentialsError("Invalid email or password")
+    """Authenticate, and resolve WHICH of the caller's records they are.
 
-    # The credentials are valid — but for WHICH application? When the caller
-    # names an account, a user who does not belong to it must not be let in
-    # through it. Without this, account_id would only pick a login
-    # implementation and never actually mean anything.
-    #
-    # This check has NO exemption for users with no accounts, and that matters:
-    # it used to skip entirely when `allowed` was empty, so that any user
-    # without a membership could name any account — including the ADMIN one —
-    # and be issued a token scoped to it. Since is_admin is derived from
-    # `account_id == AUTH_ADMIN_ACCOUNT_ID`, that turned "anyone who can sign
-    # up" into "anyone who can become an administrator". A user with no
-    # accounts can still sign in; they just cannot claim one.
-    allowed = effective_account_ids(user)
-    if req.account_id and req.account_id not in allowed:
-        logger.warning(
-            "Auth: %s belongs to accounts %s but tried to sign in via %s",
-            user.user_id,
-            allowed,
-            req.account_id,
-        )
-        # Same error as a bad password: which accounts a user belongs to
-        # isn't something an unauthenticated caller should be able to probe.
+    An email can now back several records, so a login has to pick one before
+    it can check a password at all:
+
+    * ``account_id`` named — the record for that account, and only that one. A
+      user with no record there is refused exactly as a bad password is, so an
+      unauthenticated caller cannot probe which applications an email is in.
+    * no ``account_id`` — try the email's records oldest first and sign in as
+      the first whose password verifies. Records hold independent hashes and
+      may legitimately have different passwords, so checking only the oldest
+      would reject a correct password for a newer account. The cost is one
+      bcrypt per record, bounded by how many applications one person is in.
+
+    This replaced a membership check against an array. That check had no
+    exemption for users with no accounts, and the split needs none: naming an
+    account resolves to a record IN that account or to nothing at all, so
+    there is no path that issues an admin-scoped token to someone with no
+    record in the admin account.
+    """
+    email = req.email.strip().lower()
+    repo = get_repository()
+
+    if req.account_id:
+        found = await repo.get_by_email_account(email, req.account_id)
+        candidates = [found] if found is not None else []
+    else:
+        candidates = await accounts_for_email(email)
+
+    user: UserRecord | None = None
+    for candidate in candidates:
+        if verify_password(req.password, candidate.password_hash):
+            user = candidate
+            break
+
+    if user is None:
+        # Burn one verify when there was nothing to check, so a missing email
+        # costs roughly what a wrong password does. Only when there were no
+        # candidates — otherwise the loop above already paid that cost.
+        if not candidates:
+            verify_password(req.password, _DUMMY_HASH)
+        if req.account_id:
+            logger.warning("Auth: failed login for %s via account %s", email, req.account_id)
+        # Same error either way: which applications an email belongs to isn't
+        # something an unauthenticated caller should be able to probe.
         raise InvalidCredentialsError("Invalid email or password")
 
     # Upgrade a stale hash now that we hold the plaintext — a legacy pbkdf2
     # record, or a bcrypt one imported at a lower cost than we write today.
     # Doing it on login is what lets another application's users be imported
     # with their existing hashes and migrate to our scheme without a reset.
+    # Only the record actually signed in to is rewritten: siblings carry their
+    # own hashes and are none of this login's business.
     # Best effort: a failed rewrite must never fail the sign-in.
     if needs_rehash(user.password_hash):
         try:
@@ -258,43 +345,52 @@ async def login(req: LoginRequest) -> TokenResponse:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Auth: could not upgrade password hash for %s: %s", user.user_id, exc)
 
-    logger.info("Auth: login OK for %s (account=%s)", user.user_id, req.account_id)
-    accounts = await _login_accounts(allowed)
-    # Scope the token to the account the caller named, or — when they named
-    # none — the user's default one. A user with several accounts gets a token
-    # for the default plus the full list, so the client can offer a choice and
-    # exchange it via select_account without asking for the password again.
-    #
-    # Both branches can only produce an account this user belongs to: the
-    # named one was checked against `allowed` above, and `accounts` is derived
-    # from `allowed`. The token's account scope is therefore never something
-    # the client chose for itself.
-    selected = req.account_id or (accounts[0].account_id if accounts else None)
-    return _token_for(user, account_id=selected, accounts=accounts)
+    logger.info("Auth: login OK for %s (account=%s)", user.user_id, user.account_id)
+    # Built from the person's records so the client can offer every application
+    # they hold and exchange the choice via select_account without asking for
+    # the password again. The token is scoped to the record that actually
+    # authenticated — by construction one whose password this caller proved.
+    accounts = await _login_accounts(await accounts_for_email(email))
+    return _token_for(user, accounts=accounts)
 
 
 async def select_account(user_id: str, account_id: str) -> TokenResponse:
-    """Re-issue the caller's token scoped to one of their own app accounts.
+    """Re-issue the caller's token as their record in another of their accounts.
 
-    The post-login half of multi-account sign-in: the account is baked into
-    the token's claims (knowledge-service scopes its data on it), so switching
-    means a new token. Membership is re-checked against the stored record
-    rather than trusted from the request.
+    The post-login half of multi-account sign-in. What changes is bigger than
+    it used to be: switching accounts now means switching to a DIFFERENT user
+    record, so the new token's ``sub`` is that record's ``user_id``, not the
+    one that called this. That follows from records being per-account — the
+    caller is not "the same user viewing another account", they are a
+    different principal in a different application who happens to share an
+    email.
+
+    The switch is authorised by the email alone, deliberately: the caller
+    already proved they hold this email's credentials at login, and the target
+    record is one of that email's own records. No password is asked for again,
+    exactly as before.
     """
-    user = await get_repository().get_by_id(user_id)
-    if user is None:
+    repo = get_repository()
+    current = await repo.get_by_id(user_id)
+    if current is None:
         raise UserNotFoundError(f"User {user_id!r} not found")
 
-    allowed = effective_account_ids(user)
-    if account_id not in allowed:
+    target = await repo.get_by_email_account(current.email, account_id)
+    if target is None:
+        # The person holds no record in that application. Reported to an
+        # authenticated caller as a plain 403 — unlike at login, they have
+        # already proved who they are, so there is nothing left to leak.
         raise AccountNotAllowedError(f"You do not belong to application {account_id!r}")
 
     from .app_accounts import assert_login_allowed
 
     await assert_login_allowed(account_id)
 
-    logger.info("Auth: user %s switched to account %s", user_id, account_id)
-    return _token_for(user, account_id=account_id, accounts=await _login_accounts(allowed))
+    logger.info(
+        "Auth: %s switched to account %s as %s", user_id, account_id, target.user_id
+    )
+    accounts = await _login_accounts(await accounts_for_email(current.email))
+    return _token_for(target, accounts=accounts)
 
 
 async def logout(token: str, user_id: str) -> None:
@@ -319,25 +415,25 @@ async def logout(token: str, user_id: str) -> None:
 async def get_user(user_id: str, scoped_account_id: str | None = None) -> UserPublic | None:
     """The user behind a valid token, for GET /auth/me.
 
-    ``accounts`` is resolved here rather than left empty: with the flat
-    ``account_id``/``account_ids`` fields removed from the response, this is
-    the only account information /auth/me can return, and a client restoring a
-    session from a stored token would otherwise see a user with no accounts at
-    all.
+    ``accounts`` is resolved from the caller's sibling records rather than left
+    empty: it is the only account information in the response, and a client
+    restoring a session from a stored token would otherwise see a user with no
+    accounts at all.
 
-    ``scoped_account_id`` is the caller's token claim — the account this
-    session is actually scoped to, which is not necessarily the user's stored
-    default (they may have switched via POST /auth/me/account). Passing it
-    keeps `selected` and `is_admin` consistent with the token in hand.
+    ``scoped_account_id`` is the caller's token claim. It should equal the
+    record's own ``account_id`` now that a record is per-account, but it is
+    still honoured rather than ignored: a token minted before the split, or one
+    naming an account the record has since been moved out of, must not silently
+    report a different scope than the token actually carries.
     """
     user = await get_repository().get_by_id(user_id)
     if user is None:
         return None
-    allowed = effective_account_ids(user)
-    scoped = user.model_copy(
-        update={"account_id": scoped_account_id or user.account_id}
+    return UserPublic.from_record(
+        user,
+        accounts=await _login_accounts(await accounts_for_email(user.email)),
+        scoped_account_id=scoped_account_id,
     )
-    return UserPublic.from_record(scoped, accounts=await _login_accounts(allowed))
 
 
 # ---------------------------------------------------------------------------
@@ -346,46 +442,175 @@ async def get_user(user_id: str, scoped_account_id: str | None = None) -> UserPu
 # ---------------------------------------------------------------------------
 
 async def list_users() -> list[UserPublic]:
-    """Every user, for the administration console.
+    """Every user record, for the administration console.
 
-    Each user's accounts are resolved so the console can show membership —
-    `selected` here marks the user's stored DEFAULT account, since there is no
-    session of theirs to be scoped to.
+    One row per RECORD, not per person: an email in two applications appears
+    twice, with a different ``user_id`` each time. That is the honest view now
+    — the two rows are separately deletable, separately credentialed, and an
+    administrator acting on one must be able to say which.
+
+    Each row's ``accounts`` still lists every application that person holds, so
+    the relationship between the rows is visible; ``selected`` marks the row's
+    own account.
     """
     users = await get_repository().list_all()
-    return [
-        UserPublic.from_record(u, accounts=await _login_accounts(effective_account_ids(u)))
-        for u in users
-    ]
+    # One membership query per distinct email rather than per record: a console
+    # listing every user would otherwise re-run the same query for each of a
+    # person's records.
+    by_email: dict[str, list[LoginAccount]] = {}
+    out: list[UserPublic] = []
+    for u in users:
+        key = u.email.lower()
+        if key not in by_email:
+            by_email[key] = await _login_accounts(await accounts_for_email(u.email))
+        out.append(
+            UserPublic.from_record(u, accounts=by_email[key], scoped_account_id=u.account_id)
+        )
+    return out
 
 
-async def assign_user_accounts(
-    user_id: str, account_id: str | None, account_ids: list[str]
-) -> UserPublic:
-    """Set which app accounts a user may sign in through (staff only).
+async def assign_user_accounts(user_id: str, account_ids: list[str]) -> UserPublic:
+    """Reconcile which applications a person can sign in to (staff only).
 
+    The request is still an ordered list, but it is now a desired END STATE
+    that this function makes true by moving, creating and deleting DOCUMENTS:
+
+    * a record that already sits in a wanted account is left completely alone —
+      its password is independent and a membership edit must not reset it;
+    * a record belonging to NO application is REUSED for the first wanted
+      account it can take, rather than being left behind while a new record is
+      made beside it. That matters: registration without an account is the
+      normal way a user is created before staff place them, and creating a
+      second document would strand the ``user_id`` the administrator just
+      addressed — and leave an accountless record that a login with no
+      ``account_id`` would resolve to first, silently signing the person in
+      with no scope at all;
+    * a wanted account with nothing to reuse gets a NEW record, cloning name
+      and password hash so the person can sign in immediately rather than being
+      locked out of an application they were just granted;
+    * a record whose account is not in the list is DELETED, together with its
+      credentials and anything keyed on its ``user_id``.
+
+    An EMPTY list does not delete the person: their oldest record is kept and
+    moved to no application, and the rest are removed. That preserves what an
+    empty membership meant before the split — they can still sign in, they
+    just cannot claim an account — instead of silently turning a membership
+    edit into account deletion.
+
+    Order sets the default, since a login naming no account resolves the
+    email's records oldest first.
+
+    ``user_id`` names ONE of the person's records; reconciliation applies to
+    every record sharing its email, because that is what ties them together.
     Every ID is validated against the app-account collection first, so a typo
-    can't leave a user pointed at an application that doesn't exist — they'd
-    only find out at the account picker.
+    cannot leave a person pointed at an application that does not exist.
+
+    Returns the record named by ``user_id`` when it survived, otherwise the
+    oldest surviving one — an administrator who removes the very account they
+    addressed should still get the resulting user back, not a 404.
     """
     from .app_accounts import AppAccountNotFoundError
     from .repository import get_app_account_repository
 
-    repo = get_app_account_repository()
-    extras: list[str] = []
-    for candidate in [account_id, *account_ids]:
-        if not candidate:
-            continue
-        if await repo.get(candidate) is None:
-            raise AppAccountNotFoundError(f"App account {candidate!r} not found")
-        if candidate != account_id and candidate not in extras:
-            extras.append(candidate)
-
-    updated = await get_repository().update_accounts(user_id, account_id, extras)
-    if updated is None:
+    repo = get_repository()
+    anchor = await repo.get_by_id(user_id)
+    if anchor is None:
         raise UserNotFoundError(f"User {user_id!r} not found")
 
-    logger.info("Auth: user %s accounts set to %s", user_id, effective_account_ids(updated))
+    accounts_repo = get_app_account_repository()
+    cleaned: list[str] = []
+    for candidate in account_ids:
+        if not candidate or candidate in cleaned:
+            continue
+        if await accounts_repo.get(candidate) is None:
+            raise AppAccountNotFoundError(f"App account {candidate!r} not found")
+        cleaned.append(candidate)
+
+    existing = await accounts_for_email(anchor.email)
+    held = {r.account_id: r for r in existing if r.account_id}
+    # Oldest first, and the addressed record ahead of its peers: if only one
+    # accountless record can be reused, it should be the one the administrator
+    # actually named.
+    spare = sorted(
+        (r for r in existing if not r.account_id),
+        key=lambda r: (r.user_id != anchor.user_id, r.created_at),
+    )
+
+    if not cleaned:
+        # Keep one record so the person still exists, belonging to nothing.
+        keeper = spare[0] if spare else existing[0]
+        if keeper.account_id is not None:
+            await repo.update_account(keeper.user_id, None)
+        for record in existing:
+            if record.user_id != keeper.user_id:
+                await repo.delete_by_id(record.user_id)
+        logger.info("Auth: %s removed from every application", anchor.email)
+        surviving = await accounts_for_email(anchor.email)
+        result = surviving[0] if surviving else anchor
+        return UserPublic.from_record(result, accounts=[], scoped_account_id=None)
+
+    moved: list[str] = []
+    created: list[str] = []
+    # Reuse and create BEFORE deleting. If a write fails the person keeps what
+    # they had; the other order could delete their last record and then fail to
+    # make its replacement, leaving them with no way in at all.
+    for account_id in cleaned:
+        if account_id in held:
+            continue
+        if spare:
+            reused = spare.pop(0)
+            try:
+                await repo.update_account(reused.user_id, account_id)
+            except DuplicateUserError:
+                spare.insert(0, reused)
+                continue
+            held[account_id] = reused.model_copy(update={"account_id": account_id})
+            moved.append(account_id)
+            continue
+        clone = UserRecord(
+            user_id=_new_user_id(),
+            email=anchor.email,
+            name=anchor.name,
+            # Cloned, not blank and not regenerated: the person must be able to
+            # sign in to the account they were just given. The two hashes are
+            # independent from this moment on — changing one never touches the
+            # other.
+            password_hash=anchor.password_hash,
+            account_id=account_id,
+            created_at=datetime.now(timezone.utc),
+        )
+        try:
+            await repo.create(clone)
+        except DuplicateUserError:
+            # Raced with another grant of the same pair; the winner is fine.
+            continue
+        created.append(account_id)
+
+    wanted = set(cleaned)
+    removed: list[str] = []
+    for account_id, record in list(held.items()):
+        if account_id not in wanted and await repo.delete_by_id(record.user_id):
+            removed.append(account_id)
+    # Any accountless record not reused above is surplus: it would otherwise be
+    # what a login naming no account resolves to first.
+    for leftover in spare:
+        await repo.delete_by_id(leftover.user_id)
+
+    logger.info(
+        "Auth: %s reconciled to %s (moved=%s created=%s removed=%s)",
+        anchor.email,
+        cleaned,
+        moved,
+        created,
+        removed,
+    )
+
+    surviving = await accounts_for_email(anchor.email)
+    result = next((r for r in surviving if r.user_id == anchor.user_id), None)
+    if result is None:
+        result = surviving[0] if surviving else anchor
     return UserPublic.from_record(
-        updated, accounts=await _login_accounts(effective_account_ids(updated))
+        result,
+        accounts=await _login_accounts(surviving),
+        scoped_account_id=result.account_id,
     )

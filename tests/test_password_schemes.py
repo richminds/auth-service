@@ -109,7 +109,7 @@ def test_login_upgrades_a_legacy_hash_in_place(client, monkeypatch):
 
     repo = get_repository()
     user = asyncio.get_event_loop().run_until_complete(
-        repo.get_by_email("legacy@example.com")
+        repo.get_by_email_account("legacy@example.com", None)
     )
     asyncio.get_event_loop().run_until_complete(
         repo.update_password_hash(user.user_id, legacy)
@@ -121,7 +121,7 @@ def test_login_upgrades_a_legacy_hash_in_place(client, monkeypatch):
     assert r.status_code == 200, r.text
 
     upgraded = asyncio.get_event_loop().run_until_complete(
-        repo.get_by_email("legacy@example.com")
+        repo.get_by_email_account("legacy@example.com", None)
     )
     assert upgraded.password_hash.startswith("$2b$")
     # And the password still works against the new hash.

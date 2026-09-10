@@ -65,9 +65,10 @@ def test_admin_account_id_is_stable_across_deployments(client):
     token = _staff(client)
     listed = client.get("/auth/accounts", headers=auth_headers(token)).json()
     admin = next(a for a in listed if a["account_id"] == ADMIN_ACCOUNT_ID)
-    # The slug it was derived from is recorded, so a migrated record can be
-    # traced back to the identity it had before IDs became UUIDs.
-    assert admin["legacy_account_id"] == "richminds"
+    assert admin["name"] == "RichMinds"
+    # The slug is NOT stored: an account is its UUID and its name. Keeping the
+    # old slug on the record invited treating it as a second identifier.
+    assert "legacy_account_id" not in admin
 
 
 def test_the_guest_account_is_bootstrapped_and_open_to_signups(client):
@@ -86,7 +87,7 @@ def test_the_guest_account_is_bootstrapped_and_open_to_signups(client):
     listed = client.get("/auth/accounts", headers=auth_headers(token)).json()
     guest = next(a for a in listed if a["account_id"] == GUEST_ACCOUNT_UUID)
     assert guest["name"] == "Guest"
-    assert guest["legacy_account_id"] == "guest"
+    assert "legacy_account_id" not in guest
 
     # Public sign-up into it — no admin token involved.
     r = client.post(

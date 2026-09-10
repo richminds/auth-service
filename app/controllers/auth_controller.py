@@ -33,12 +33,16 @@ async def auth_health() -> dict[str, str]:
 
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
 async def register(payload: RegisterRequest) -> TokenResponse:
-    """Register a new user.
+    """Register a new user record, in ONE application.
 
-    ``payload.account_id`` is optional and is the user's only scope — the
-    application they belong to. Omit it for a user who is not tied to one
-    yet; an administrator can assign accounts later via
+    ``payload.account_id`` is optional and is the record's only scope — the
+    application it belongs to. Omit it for a user who is not tied to one yet;
+    an administrator can assign accounts later via
     PATCH /auth/users/{user_id}/accounts.
+
+    An email that already exists in a DIFFERENT application is not a conflict:
+    it creates a second, independent record with its own user_id and its own
+    password. 409 is returned only for the same email in the same application.
     """
     return await service.register(payload)
 
@@ -127,14 +131,21 @@ async def logout(request: Request, user: AuthUser = Depends(get_current_user)) -
 # ---------------------------------------------------------------------------
 # User administration — administrators only (see require_admin)
 #
-# A user's only scope is the app account(s) they belong to; there is no
-# organization or tenant to manage, so membership is set through the accounts
-# endpoint below and nowhere else.
+# A user's only scope is the app account their record belongs to; there is no
+# organization or tenant to manage. One record is one person in one account,
+# so "membership" is which records exist — set through the accounts endpoint
+# below and nowhere else.
 # ---------------------------------------------------------------------------
 
 @router.get("/users", response_model=list[UserPublic])
 async def list_users(_: AuthUser = Depends(require_admin)) -> list[UserPublic]:
-    """List every registered user, including their account membership."""
+    """List every user RECORD, including the account membership behind it.
+
+    One row per (email, account) pair: a person who holds two applications
+    appears twice, with a different user_id each time, because those really
+    are two separately credentialed records. Each row still carries the full
+    ``accounts`` list, so the rows for one person can be related to each other.
+    """
     return await service.list_users()
 
 
@@ -146,11 +157,21 @@ async def assign_user_accounts(
 ) -> UserPublic:
     """Set which applications a user may sign in through.
 
-    ``account_id`` is their default (what a login that names no account gets);
-    ``account_ids`` are the extras that make the sign-in account picker appear.
-    404 if any of them isn't a registered app account.
+    The list is a desired end state, and the service reconciles the person's
+    user records to match it: an account they lack gets a new record (cloning
+    this record's name and password hash so they can sign in at once), and an
+    account dropped from the list has its record DELETED along with its
+    credentials. Accounts already held are untouched — their passwords are
+    independent and a membership edit must not reset them.
+
+    ``user_id`` names one of the person's records; the reconciliation applies
+    to every record sharing its email. The FIRST entry is their default (what
+    a login naming no account resolves to), and more than one makes the
+    sign-in account picker appear. An empty list removes them from every
+    application, deleting all of their records. 404 if any ID isn't a
+    registered app account.
     """
-    return await service.assign_user_accounts(user_id, payload.account_id, payload.account_ids)
+    return await service.assign_user_accounts(user_id, payload.account_ids)
 
 
 # ---------------------------------------------------------------------------

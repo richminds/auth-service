@@ -40,19 +40,16 @@ class AuthSettings(BaseSettings):
     # ------------------------------------------------------------------- JWT
     jwt_secret: str = Field(default="dev-secret-change-me", validation_alias="AUTH_JWT_SECRET")
     jwt_algorithm: str = Field(default="HS256", validation_alias="AUTH_JWT_ALGORITHM")
-    # Downstream services verify tokens locally and never see this service's
-    # revocation list, so this value IS the window in which a logged-out or
-    # deleted user still works against them (see the README's token lifecycle
-    # section). Kept short for that reason; there is no refresh token, so
-    # raising it trades revocation latency for fewer re-logins.
+    # The api-gateway caches introspection answers, so this value bounds how
+    # long a logged-out or deleted user can still work downstream (that cache
+    # TTL bounds it further). Kept short for that reason; there is no refresh
+    # token, so raising it trades revocation latency for fewer re-logins.
     access_ttl_minutes: int = Field(default=60, validation_alias="AUTH_ACCESS_TTL_MINUTES")
-    # This service is the trust root for end-user identity (sub, account_id) —
-    # llm-gateway and knowledge-service each validate tokens minted here rather
-    # than issuing their own, so `iss` must equal their configured
-    # LLM_JWT_ISSUER/RAG_JWT_ISSUER and `aud` must include their configured
-    # LLM_JWT_AUDIENCE/RAG_JWT_AUDIENCE. That only works if AUTH_JWT_SECRET
-    # equals LLM_JWT_SECRET and RAG_JWT_SECRET (HS256 is symmetric) — see each
-    # service's .env.example.
+    # This service is the trust root for end-user identity (sub, account_id),
+    # and now the ONLY holder of the signing key: llm-gateway and
+    # knowledge-service no longer validate tokens themselves — the api-gateway
+    # asks this service (GET /auth/me) and injects verified identity headers.
+    # iss/aud are still stamped for any future verifier.
     jwt_issuer: str = Field(default="auth-service", validation_alias="AUTH_JWT_ISSUER")
     jwt_audience_raw: str = Field(
         default="llm-gateway,knowledge-service", validation_alias="AUTH_JWT_AUDIENCE"
@@ -88,8 +85,10 @@ class AuthSettings(BaseSettings):
 
     # ------------------------------------------------------------------- admin
     # Administering this service (app accounts) is gated on membership of ONE
-    # app account — the RichMinds admin application. A user whose
-    # UserRecord.account_id equals this value is an admin; nobody else is.
+    # app account — the RichMinds admin application. A user record whose
+    # UserRecord.account_id EQUALS this value is an admin; nobody else is.
+    # Since records are per-account, that is a property of the single document
+    # the caller signed in as, not a search through a membership list.
     #
     # Account IDs are UUIDs, so this default cannot be a readable slug any
     # more. It is DERIVED from the old "richminds" slug rather than random
