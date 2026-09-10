@@ -52,7 +52,19 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_ROOT))
+
+# Read the same .env the service reads (features/config.py points pydantic at
+# it). Without this the script sees only the raw process environment and would
+# either abort or, worse, target a different cluster than the running service.
+# Real environment variables still win, so CI can override.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(_ROOT / ".env", override=False)
+except ImportError:  # pragma: no cover — python-dotenv ships with pydantic-settings
+    pass
 
 from features.account_ids import account_uuid_for  # noqa: E402
 

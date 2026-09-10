@@ -70,6 +70,62 @@ def test_admin_account_id_is_stable_across_deployments(client):
     assert admin["legacy_account_id"] == "richminds"
 
 
+def test_the_guest_account_is_bootstrapped_and_open_to_signups(client):
+    """The knowledge console's "Create User" button depends on both halves.
+
+    It registers people straight into the guest account from a public form, so
+    (a) the account has to exist without anyone creating it, and (b) its ID has
+    to be knowable by a client that has no session — hence a derived UUID that
+    the console can hold as a constant. If either broke, that button would 404.
+    """
+    from features.account_ids import GUEST_ACCOUNT_UUID, account_uuid_for
+
+    assert GUEST_ACCOUNT_UUID == account_uuid_for("guest")
+
+    token = _staff(client)
+    listed = client.get("/auth/accounts", headers=auth_headers(token)).json()
+    guest = next(a for a in listed if a["account_id"] == GUEST_ACCOUNT_UUID)
+    assert guest["name"] == "Guest"
+    assert guest["legacy_account_id"] == "guest"
+
+    # Public sign-up into it — no admin token involved.
+    r = client.post(
+        "/auth/register",
+        json={
+            "email": "newbie@example.com",
+            "name": "Newbie",
+            "password": "hunter22",
+            "account_id": GUEST_ACCOUNT_UUID,
+        },
+    )
+    assert r.status_code == 201, r.text
+    user = r.json()["user"]
+    assert selected_account(user) == GUEST_ACCOUNT_UUID
+    # A guest is emphatically not an administrator.
+    assert user["is_admin"] is False
+    guest_token = r.json()["access_token"]
+    assert client.get("/auth/accounts", headers=auth_headers(guest_token)).status_code == 403
+
+
+def test_guest_signups_cannot_name_the_admin_account(client):
+    """The guest sign-up form posts to the same public endpoint an attacker
+    would, so the account it names is the only thing separating the two. Once
+    an admin exists, self-registration into the admin account is closed —
+    without that, this console's public form would be an admin factory."""
+    admin_token(client, "the-first@richminds.io")
+
+    r = client.post(
+        "/auth/register",
+        json={
+            "email": "sneaky@example.com",
+            "name": "Sneaky",
+            "password": "hunter22",
+            "account_id": ADMIN_ACCOUNT_ID,
+        },
+    )
+    assert r.status_code == 403
+
+
 def test_admin_account_is_closed_after_the_first_admin(client):
     """Registration is public, so the admin account can only be self-joined
     once — otherwise anyone knowing the ID could sign themselves up as one."""

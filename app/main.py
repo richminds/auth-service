@@ -21,7 +21,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from features import __version__
-from features.app_accounts import ensure_admin_account
+from features.app_accounts import ensure_admin_account, ensure_guest_account
 from features.config import auth_settings
 from features.repository import close_repository, init_repository
 
@@ -60,12 +60,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     await init_repository()
 
-    # Membership of this account is what grants admin access, so it has to
-    # exist before the first administrator can be tied to it.
-    try:
-        await ensure_admin_account()
-    except Exception as exc:  # noqa: BLE001 — best effort, same as above
-        logger.warning("Auth Service: could not bootstrap the admin app account: %s", exc)
+    # Membership of the admin account is what grants admin access, so it has
+    # to exist before the first administrator can be tied to it. The guest
+    # account has to exist before the knowledge console's sign-up can register
+    # anyone into it. Both IDs are derived, so this is safe to re-run.
+    for bootstrap in (ensure_admin_account, ensure_guest_account):
+        try:
+            await bootstrap()
+        except Exception as exc:  # noqa: BLE001 — best effort, same as above
+            logger.warning(
+                "Auth Service: could not bootstrap a well-known app account (%s): %s",
+                bootstrap.__name__,
+                exc,
+            )
 
     logger.info(
         "Auth Service ready — mongo=%s db=%s",

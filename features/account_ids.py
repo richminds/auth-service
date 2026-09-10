@@ -50,3 +50,10 @@ def new_account_uuid() -> str:
 # in every environment and can serve as the default for AUTH_ADMIN_ACCOUNT_ID.
 ADMIN_ACCOUNT_SLUG = "richminds"
 ADMIN_ACCOUNT_UUID = account_uuid_for(ADMIN_ACCOUNT_SLUG)
+
+# The guest app account. Derived for the same reason the admin one is: the
+# knowledge-ingest console signs new people up into it straight from its own
+# sign-in screen, so it needs an ID it can name before the account exists —
+# there is no admin session in that flow to look one up with.
+GUEST_ACCOUNT_SLUG = "guest"
+GUEST_ACCOUNT_UUID = account_uuid_for(GUEST_ACCOUNT_SLUG)

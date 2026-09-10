@@ -25,7 +25,12 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 
-from .account_ids import new_account_uuid
+from .account_ids import (
+    ADMIN_ACCOUNT_SLUG,
+    GUEST_ACCOUNT_SLUG,
+    GUEST_ACCOUNT_UUID,
+    new_account_uuid,
+)
 from .repository import get_app_account_repository
 from .schemas import AppAccountRecord, AppType
 
@@ -71,41 +76,78 @@ async def assert_login_allowed(account_id: str) -> None:
         raise AppAccountDisabledError(f"Application {account_id!r} is disabled")
 
 
-async def ensure_admin_account() -> AppAccountRecord:
-    """Idempotently ensure the admin app account exists.
+async def _ensure_account(
+    account_id: str, slug: str, name: str, description: str, app_type: AppType
+) -> AppAccountRecord:
+    """Idempotently ensure one well-known app account exists.
 
-    Membership of this account is the only thing that grants administrative
-    access (features/dependencies.py::require_admin), so it has to exist before
-    anyone can be tied to it — otherwise there is no way to create the first
-    admin. Bootstrapped at startup, same shape as the user bootstrap.
+    Both bootstrapped accounts have IDs that are DERIVED rather than minted
+    (features/account_ids.py), which is what makes bootstrapping them possible
+    at all: something outside this service has to be able to name them before
+    they exist — ``AUTH_ADMIN_ACCOUNT_ID`` for the admin one, the knowledge
+    console's sign-up for the guest one.
     """
-    from .config import auth_settings
-
     repo = get_app_account_repository()
-    existing = await repo.get(auth_settings.admin_account_id)
+    existing = await repo.get(account_id)
     if existing is not None:
         return existing
 
     account = AppAccountRecord(
-        account_id=auth_settings.admin_account_id,
-        # Derived from this slug (features/account_ids.py), so a freshly
-        # bootstrapped database and one put through the backfill agree on the
-        # admin account's ID instead of diverging.
-        legacy_account_id="richminds",
-        name="RichMinds",
-        description="Administrators of this auth service.",
+        account_id=account_id,
+        legacy_account_id=slug,
+        name=name,
+        description=description,
+        app_type=app_type,
         created_by="system:bootstrap",
         created_at=datetime.now(UTC),
     )
     try:
         await repo.create(account)
     except Exception:  # noqa: BLE001 — lost a create race; the winner is fine
-        winner = await repo.get(auth_settings.admin_account_id)
+        winner = await repo.get(account_id)
         if winner is not None:
             return winner
         raise
-    logger.info("Auth: bootstrapped the admin app account (account_id=%s)", account.account_id)
+    logger.info("Auth: bootstrapped the %s app account (account_id=%s)", slug, account_id)
     return account
+
+
+async def ensure_admin_account() -> AppAccountRecord:
+    """Idempotently ensure the admin app account exists.
+
+    Membership of this account is the only thing that grants administrative
+    access (features/dependencies.py::require_admin), so it has to exist before
+    anyone can be tied to it — otherwise there is no way to create the first
+    admin.
+    """
+    from .config import auth_settings
+
+    return await _ensure_account(
+        auth_settings.admin_account_id,
+        ADMIN_ACCOUNT_SLUG,
+        "RichMinds",
+        "Maintains all the app accounts.",
+        AppType.ADMIN,
+    )
+
+
+async def ensure_guest_account() -> AppAccountRecord:
+    """Idempotently ensure the guest app account exists.
+
+    The knowledge-ingest console lets people create their own account from its
+    sign-in screen, registering them into THIS account
+    (POST /auth/register with GUEST_ACCOUNT_UUID). That call 404s if the
+    account is missing, so bootstrapping it here is what keeps that button from
+    being broken on a fresh deployment — the same reason the admin account is
+    bootstrapped.
+    """
+    return await _ensure_account(
+        GUEST_ACCOUNT_UUID,
+        GUEST_ACCOUNT_SLUG,
+        "Guest",
+        "Maintains all the Guest user for knowledge service.",
+        AppType.SERVICE,
+    )
 
 
 async def create_app_account(
