@@ -8,16 +8,15 @@ to live in the token rather than in the client.
 """
 from __future__ import annotations
 
-from .conftest import ADMIN_ACCOUNT_ID, admin_token, auth_headers, register
-
-
-def _make_account(client, staff: str, account_id: str, name: str) -> None:
-    r = client.post(
-        "/auth/accounts",
-        json={"account_id": account_id, "name": name},
-        headers=auth_headers(staff),
-    )
-    assert r.status_code == 201, r.text
+from .conftest import (
+    ADMIN_ACCOUNT_ID,
+    account_ids,
+    admin_token,
+    auth_headers,
+    create_account,
+    register,
+    selected_account,
+)
 
 
 def _login(client, email: str, password: str = "hunter22", **extra) -> dict:
@@ -26,54 +25,66 @@ def _login(client, email: str, password: str = "hunter22", **extra) -> dict:
     return r.json()
 
 
-def _two_account_user(client) -> str:
-    """A user belonging to two applications. Returns their email.
+def _two_account_user(client) -> tuple[str, str, str]:
+    """A user belonging to two applications.
+
+    Returns their email plus the two generated account IDs — the service mints
+    those now, so a test cannot name them up front.
 
     The administrator is created by registering into the admin app account —
     membership of it is the only thing that grants admin rights now.
     """
     staff = admin_token(client)
-    _make_account(client, staff, "ingest", "Knowledge Ingest")
-    _make_account(client, staff, "portal", "Customer Portal")
+    ingest = create_account(client, staff, "Knowledge Ingest")["account_id"]
+    portal = create_account(client, staff, "Customer Portal")["account_id"]
 
     _, user = register(client, "multi@example.com", "Multi User")
     r = client.patch(
         f"/auth/users/{user['user_id']}/accounts",
-        json={"account_id": "ingest", "account_ids": ["portal"]},
+        json={"account_id": ingest, "account_ids": [portal]},
         headers=auth_headers(staff),
     )
     assert r.status_code == 200, r.text
-    return "multi@example.com"
+    return "multi@example.com", ingest, portal
 
 
 def test_login_lists_every_account_and_defaults_to_the_primary(client):
-    email = _two_account_user(client)
+    email, ingest, portal = _two_account_user(client)
 
     body = _login(client, email)
-    assert [a["account_id"] for a in body["user"]["accounts"]] == ["ingest", "portal"]
+    assert account_ids(body["user"]) == [ingest, portal]
     assert [a["name"] for a in body["user"]["accounts"]] == ["Knowledge Ingest", "Customer Portal"]
     # No account named at login → their default, so a single-account client
     # that never offers a picker still gets a usable token.
-    assert body["user"]["account_id"] == "ingest"
+    assert selected_account(body["user"]) == ingest
+    # Exactly one entry is marked: `selected` replaced the flat account_id, so
+    # an ambiguous or absent mark would leave a client unable to tell which
+    # account the token is actually scoped to.
+    assert [a["selected"] for a in body["user"]["accounts"]] == [True, False]
+    assert "account_id" not in body["user"]
+    assert "account_ids" not in body["user"]
 
 
 def test_selecting_an_account_rescopes_the_token(client):
-    email = _two_account_user(client)
+    email, _ingest, portal = _two_account_user(client)
     token = _login(client, email)["access_token"]
 
     r = client.post(
-        "/auth/me/account", json={"account_id": "portal"}, headers=auth_headers(token)
+        "/auth/me/account", json={"account_id": portal}, headers=auth_headers(token)
     )
     assert r.status_code == 200, r.text
-    assert r.json()["user"]["account_id"] == "portal"
+    assert selected_account(r.json()["user"]) == portal
 
-    # The new token carries the choice — that claim is the whole point.
+    # The new token carries the choice — that claim is the whole point — and
+    # /auth/me must report the SWITCHED account, not the stored default, or a
+    # client restoring a session would silently fall back to the wrong scope.
     me = client.get("/auth/me", headers=auth_headers(r.json()["access_token"]))
     assert me.status_code == 200
+    assert selected_account(me.json()) == portal
 
 
 def test_login_through_a_non_member_account_is_rejected(client):
-    email = _two_account_user(client)
+    email, _ingest, _portal = _two_account_user(client)
 
     r = client.post(
         "/auth/login",
@@ -85,7 +96,7 @@ def test_login_through_a_non_member_account_is_rejected(client):
 
 
 def test_selecting_a_non_member_account_is_forbidden(client):
-    email = _two_account_user(client)
+    email, _ingest, _portal = _two_account_user(client)
     token = _login(client, email)["access_token"]
 
     r = client.post(
@@ -130,7 +141,7 @@ def test_naming_the_admin_account_never_grants_admin(client):
 
 def test_the_token_scope_is_never_chosen_by_the_client(client):
     """A member of one account cannot have their token scoped to another."""
-    email = _two_account_user(client)
+    email, _ingest, _portal = _two_account_user(client)
 
     r = client.post(
         "/auth/login",

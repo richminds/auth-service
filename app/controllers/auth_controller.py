@@ -14,6 +14,7 @@ from features.schemas import (
     AppAccountRecord,
     AssignUserAccountsRequest,
     CreateAppAccountRequest,
+    LoginAccount,
     LoginRequest,
     RegisterRequest,
     SelectAccountRequest,
@@ -83,18 +84,29 @@ async def select_my_account(
 @router.get("/me", response_model=UserPublic)
 async def me(user: AuthUser = Depends(get_current_user)) -> UserPublic:
     """Return the current user's profile (validates the bearer token)."""
-    found = await service.get_user(user.user_id)
+    # Pass the token's account so `selected`/`is_admin` describe THIS session,
+    # not the user's stored default — they differ after POST /auth/me/account.
+    found = await service.get_user(user.user_id, scoped_account_id=user.account_id)
     if found is None:
         # Token valid but user no longer exists in this service's own store
         # (e.g. an app account whose users live elsewhere) — fall back to the
         # token's claims.
         from features.config import auth_settings
 
+        # The flat account_id is gone from the response, so the token's account
+        # has to be reported the way every other path reports it: as the
+        # selected entry of `accounts`. There is no record to look up a display
+        # name in on this path, so the ID stands in for it.
+        accounts = (
+            [LoginAccount(account_id=user.account_id, name=user.account_id, selected=True)]
+            if user.account_id
+            else []
+        )
         return UserPublic(
             user_id=user.user_id,
             email=user.email or "",
             name=user.name or "",
-            account_id=user.account_id,
+            accounts=accounts,
             is_admin=bool(user.account_id) and user.account_id == auth_settings.admin_account_id,
         )
     return found
@@ -160,14 +172,15 @@ async def register_app_account(
     payload: CreateAppAccountRequest,
     user: AuthUser = Depends(require_admin),
 ) -> AppAccountRecord:
-    """Register an application. 409 if the account_id is already taken.
+    """Register an application and mint its ID.
 
-    ``account_id`` is supplied by the caller, not generated: it is the value
-    the application will send as LoginRequest.account_id, so it has to be a
-    value that application already knows.
+    ``account_id`` is generated, not supplied: it is an authorization key —
+    the value the application sends as LoginRequest.account_id and the value
+    downstream services scope their data on — so it must not be guessable.
+    The created record in the response carries the UUID to put into that
+    application's configuration.
     """
     return await app_accounts.create_app_account(
-        payload.account_id,
         payload.name,
         payload.description,
         created_by=user.user_id,

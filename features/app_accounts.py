@@ -6,6 +6,10 @@ console, and anything onboarded later, each register once here; the
 ``LoginRequest.account_id`` when its users sign in
 (app/controllers/auth_controller.py::login).
 
+That ID is a **UUID generated here** (features/account_ids.py), not a slug the
+caller picks. Registering an application therefore returns the ID to put in
+its config, rather than confirming one the caller already chose.
+
 Stored in its own collection (``app_accounts``). An app account is the ONLY
 scope a user has: it names the application they authenticate against, and it
 is the value downstream services filter their data on.
@@ -21,6 +25,7 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 
+from .account_ids import new_account_uuid
 from .repository import get_app_account_repository
 from .schemas import AppAccountRecord, AppType
 
@@ -83,6 +88,10 @@ async def ensure_admin_account() -> AppAccountRecord:
 
     account = AppAccountRecord(
         account_id=auth_settings.admin_account_id,
+        # Derived from this slug (features/account_ids.py), so a freshly
+        # bootstrapped database and one put through the backfill agree on the
+        # admin account's ID instead of diverging.
+        legacy_account_id="richminds",
         name="RichMinds",
         description="Administrators of this auth service.",
         created_by="system:bootstrap",
@@ -100,16 +109,27 @@ async def ensure_admin_account() -> AppAccountRecord:
 
 
 async def create_app_account(
-    account_id: str,
     name: str,
     description: str,
     created_by: str,
     app_type: AppType = AppType.OTHER,
     app_url: str = "",
 ) -> AppAccountRecord:
+    """Register an application and mint its ID.
+
+    The ID is generated rather than accepted from the caller: it is an
+    authorization key (applications name it at login, downstream services
+    scope data on it), and a caller-chosen one would be guessable. The
+    returned ``account_id`` is what goes into the application's config.
+
+    A UUID collision is not a real possibility, but the repository's unique
+    index is still the authority — the retry loop keeps a freak duplicate from
+    surfacing as a 500.
+    """
     repo = get_app_account_repository()
-    if await repo.get(account_id) is not None:
-        raise AppAccountExistsError(f"App account {account_id!r} already exists")
+    account_id = new_account_uuid()
+    while await repo.get(account_id) is not None:  # pragma: no cover — 1 in 2^122
+        account_id = new_account_uuid()
 
     account = AppAccountRecord(
         account_id=account_id,

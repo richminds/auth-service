@@ -4,9 +4,15 @@ One scope, not two. A user belongs to APP ACCOUNTS (``account_id`` plus
 ``account_ids``) and nothing else — there is no separate organization or
 tenant field, and downstream services scope their data on the account.
 
-The login/registration response carries the user ONCE: ``account_id``,
-``account_ids`` and ``accounts`` all live inside ``user`` rather than being
-repeated at the top level.
+**In responses, ``accounts`` carries all of it.** ``UserPublic`` deliberately
+does NOT repeat ``account_id``/``account_ids`` alongside it: those were three
+views of the same membership that could disagree, and a client had no way to
+tell which was authoritative. The one thing the flat fields said that the list
+did not — WHICH account this session is scoped to — is now ``selected`` on the
+list entry itself, so the list really is the whole story.
+
+An ``account_id`` is a UUID (see features/account_ids.py), never a readable
+slug.
 """
 from __future__ import annotations
 
@@ -46,44 +52,53 @@ class UserRecord(BaseModel):
 class UserPublic(BaseModel):
     """The user, as returned to clients and embedded in tokens.
 
-    This is the ONLY place account membership appears in a response — the
-    login/registration envelope does not repeat it. ``account_id`` is the
-    account this session is scoped to, ``account_ids`` every account the user
-    may use, and ``accounts`` the same set with display names for a picker.
+    Account membership appears exactly once, as ``accounts``. The flat
+    ``account_id``/``account_ids`` fields that used to sit beside it are gone:
+    they were the same membership expressed three ways, and nothing said which
+    copy won if they disagreed. The scoped account is now the entry with
+    ``selected`` set — see LoginAccount.
     """
 
     user_id: str
     email: str
     name: str
-    account_id: str | None = None
-    """The account this session is scoped to. Downstream services filter their
-    data on it, so it travels in the token."""
-    account_ids: list[str] = Field(default_factory=list)
-    """Every account this user may sign in through, primary one first."""
     accounts: list["LoginAccount"] = Field(default_factory=list)
-    """The same accounts with display names. Populated only where a client
-    needs to choose between them (login, register, account switch); an
-    id-and-name pair rather than two positional lists, so a name that happens
-    to be duplicated can still be resolved back to its account."""
+    """Every account this user may sign in through, primary one first, each
+    with its display name and whether this session is scoped to it.
+
+    Populated wherever a client needs it — login, registration, account
+    switch, and GET /auth/me — because with the flat fields removed this is
+    the only account information in the response."""
     is_admin: bool = False
-    """True when the user belongs to the configured admin app account — the
-    only gate on the account-administration endpoints."""
+    """True when this session is scoped to the configured admin app account —
+    the only gate on the account-administration endpoints."""
     created_at: datetime | None = None
 
     @classmethod
     def from_record(
         cls, r: UserRecord, accounts: list["LoginAccount"] | None = None
     ) -> "UserPublic":
+        """Build the response for ``r``.
+
+        ``r.account_id`` is the SCOPED account (service._token_for copies the
+        record with the session's account before calling this), so it decides
+        both ``is_admin`` and which entry is marked ``selected``. Marking
+        happens here rather than in the caller so every path that returns a
+        user — login, register, switch, /auth/me — agrees on it.
+        """
         from .config import auth_settings
 
+        scoped = r.account_id
+        marked = [
+            a.model_copy(update={"selected": bool(scoped) and a.account_id == scoped})
+            for a in (accounts or [])
+        ]
         return cls(
             user_id=r.user_id,
             email=r.email,
             name=r.name,
-            account_id=r.account_id,
-            account_ids=list(r.account_ids),
-            accounts=accounts or [],
-            is_admin=bool(r.account_id) and r.account_id == auth_settings.admin_account_id,
+            accounts=marked,
+            is_admin=bool(scoped) and scoped == auth_settings.admin_account_id,
             created_at=r.created_at,
         )
 
@@ -118,6 +133,18 @@ class LoginAccount(BaseModel):
 
     account_id: str
     name: str
+    selected: bool = False
+    """True on the account THIS session is scoped to — the one whose ID is in
+    the token and which downstream services filter their data on.
+
+    This is what replaced ``UserPublic.account_id``. Without it the response
+    would say which accounts a user may use but not which one they are
+    currently using, and a client could not render the active account, default
+    an account picker, or tell that POST /auth/me/account had taken effect.
+
+    Exactly one entry is marked when the session is scoped to an account the
+    user still belongs to; none are marked for a user who belongs to no
+    account yet (the client should then prompt for one)."""
 
 
 class SelectAccountRequest(BaseModel):
@@ -159,9 +186,6 @@ class TokenResponse(BaseModel):
 # or tenant field (see UserRecord).
 # ---------------------------------------------------------------------------
 
-_ACCOUNT_ID_PATTERN = r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$"
-
-
 class AppType(StrEnum):
     """What kind of application an app account is.
 
@@ -180,10 +204,25 @@ class AppType(StrEnum):
 
 class AppAccountRecord(BaseModel):
     account_id: str
-    """Caller-chosen, stable identifier an application sends as
-    LoginRequest.account_id (e.g. "richminds"). Never generated — the
-    application already knows the value it will send, so letting the service
-    mint one would guarantee a mismatch."""
+    """The account's UUID — generated here, never supplied by the caller, and
+    immutable. It is the value the application sends as
+    LoginRequest.account_id and the value downstream services scope their data
+    on.
+
+    This replaced a caller-chosen slug ("richminds"). The slug was readable but
+    it was also guessable, and it conflated a display label with an
+    authorization key: knowing it was most of what you needed to name an
+    account at login. Operators now read the UUID off this record (the admin
+    console shows it) and put it in the application's config.
+
+    See features/account_ids.py for how the value is produced — derived for
+    accounts that predate this change so every environment agrees, random for
+    ones registered afterwards."""
+    legacy_account_id: str = ""
+    """The slug this account used before IDs became UUIDs, kept for tracing a
+    migrated record back to its old identity and to make the backfill
+    (scripts/migrate_account_uuid.py) re-runnable. Never used to authenticate
+    or to scope data — it is not an alias for account_id."""
     name: str
     description: str = ""
     app_type: AppType = AppType.OTHER
@@ -210,7 +249,9 @@ def _validate_app_url(value: str) -> str:
 
 
 class CreateAppAccountRequest(BaseModel):
-    account_id: str = Field(pattern=_ACCOUNT_ID_PATTERN, max_length=64)
+    """Register an application. The ID is generated, so it isn't an input —
+    the response carries the UUID to put in that application's config."""
+
     name: str = Field(min_length=1, max_length=200)
     description: str = Field(default="", max_length=1000)
     app_type: AppType = AppType.OTHER

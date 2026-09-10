@@ -110,9 +110,9 @@ def _token_for(
             "role": _role_for(scoped_account_id),
         },
     )
-    # The account membership lives on the user and nowhere else — the envelope
-    # used to repeat account_id/accounts alongside it, which meant two copies
-    # that could disagree and no way for a client to tell which was right.
+    # from_record reads the SCOPED account off the record to decide is_admin
+    # and to mark the selected entry in `accounts`, so hand it a copy carrying
+    # this session's account rather than the user's stored default.
     scoped = user.model_copy(update={"account_id": scoped_account_id})
     return TokenResponse(
         access_token=token,
@@ -316,9 +316,28 @@ async def logout(token: str, user_id: str) -> None:
         logger.warning("Auth: logout for user %s could not revoke token: %s", user_id, exc)
 
 
-async def get_user(user_id: str) -> UserPublic | None:
+async def get_user(user_id: str, scoped_account_id: str | None = None) -> UserPublic | None:
+    """The user behind a valid token, for GET /auth/me.
+
+    ``accounts`` is resolved here rather than left empty: with the flat
+    ``account_id``/``account_ids`` fields removed from the response, this is
+    the only account information /auth/me can return, and a client restoring a
+    session from a stored token would otherwise see a user with no accounts at
+    all.
+
+    ``scoped_account_id`` is the caller's token claim — the account this
+    session is actually scoped to, which is not necessarily the user's stored
+    default (they may have switched via POST /auth/me/account). Passing it
+    keeps `selected` and `is_admin` consistent with the token in hand.
+    """
     user = await get_repository().get_by_id(user_id)
-    return UserPublic.from_record(user) if user else None
+    if user is None:
+        return None
+    allowed = effective_account_ids(user)
+    scoped = user.model_copy(
+        update={"account_id": scoped_account_id or user.account_id}
+    )
+    return UserPublic.from_record(scoped, accounts=await _login_accounts(allowed))
 
 
 # ---------------------------------------------------------------------------
@@ -327,8 +346,17 @@ async def get_user(user_id: str) -> UserPublic | None:
 # ---------------------------------------------------------------------------
 
 async def list_users() -> list[UserPublic]:
+    """Every user, for the administration console.
+
+    Each user's accounts are resolved so the console can show membership —
+    `selected` here marks the user's stored DEFAULT account, since there is no
+    session of theirs to be scoped to.
+    """
     users = await get_repository().list_all()
-    return [UserPublic.from_record(u) for u in users]
+    return [
+        UserPublic.from_record(u, accounts=await _login_accounts(effective_account_ids(u)))
+        for u in users
+    ]
 
 
 async def assign_user_accounts(
@@ -358,4 +386,6 @@ async def assign_user_accounts(
         raise UserNotFoundError(f"User {user_id!r} not found")
 
     logger.info("Auth: user %s accounts set to %s", user_id, effective_account_ids(updated))
-    return UserPublic.from_record(updated)
+    return UserPublic.from_record(
+        updated, accounts=await _login_accounts(effective_account_ids(updated))
+    )

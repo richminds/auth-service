@@ -5,9 +5,10 @@ should authenticate users through this service instead of embedding auth
 logic directly.
 """
 from .client import (
+    AppAccountRecord,
     AuthServiceClient,
     AuthServiceError,
-    OrganizationRecord,
+    LoginAccount,
     TokenResponse,
     UserPublic,
 )
@@ -17,5 +18,6 @@ __all__ = [
     "AuthServiceError",
     "TokenResponse",
     "UserPublic",
-    "OrganizationRecord",
+    "LoginAccount",
+    "AppAccountRecord",
 ]

@@ -16,8 +16,12 @@ Usage::
 
 Every non-2xx response raises ``AuthServiceError`` carrying the HTTP status
 code, so a caller can distinguish 401 (bad credentials / invalid token), 403
-(not platform staff), 409 (email taken), 422 (malformed email/password), and
-404 (organization/user not found).
+(not an administrator, or a disabled application), 409 (email taken), 422
+(malformed email/password), and 404 (app account / user not found).
+
+A user's only scope is the APP ACCOUNT — the application they signed in
+through, identified by a UUID. Organizations no longer exist; the methods that
+managed them are gone along with the routes they called.
 """
 from __future__ import annotations
 
@@ -33,14 +37,40 @@ DEFAULT_TIMEOUT = 15.0
 
 
 @dataclass
+class LoginAccount:
+    """One app account the user may sign in through."""
+
+    account_id: str
+    name: str
+    selected: bool = False
+    """True on the account this session's token is scoped to."""
+
+
+@dataclass
 class UserPublic:
-    """Mirror of ``features.schemas.UserPublic``."""
+    """Mirror of ``features.schemas.UserPublic``.
+
+    Account membership is carried ONLY by ``accounts``; there are no flat
+    ``account_id``/``account_ids`` fields to disagree with it. Use
+    ``account_id`` below to read the scoped account.
+    """
 
     user_id: str
     email: str
     name: str
-    org_id: str | None = None
+    accounts: list[LoginAccount] = field(default_factory=list)
+    is_admin: bool = False
     created_at: str | None = None
+
+    @property
+    def account_id(self) -> str | None:
+        """The account this session is scoped to — the selected entry.
+
+        Downstream services (llm-gateway, knowledge-service) filter their data
+        on this value; forward it as ``X-Account-ID`` on calls made on this
+        user's behalf.
+        """
+        return next((a.account_id for a in self.accounts if a.selected), None)
 
 
 @dataclass
@@ -48,27 +78,37 @@ class TokenResponse:
     access_token: str
     user: UserPublic
     token_type: str = "bearer"
-    account_id: str | None = None
-    """The application the user belongs to. Forward it as X-Account-ID on
-    later llm-gateway/knowledge-service calls made on this user's behalf."""
+
+    @property
+    def account_id(self) -> str | None:
+        """The scoped account, read off the user rather than repeated here —
+        the envelope used to carry its own copy that could disagree."""
+        return self.user.account_id
 
 
 @dataclass
-class OrganizationRecord:
-    org_id: str
+class AppAccountRecord:
+    """A registered application. ``account_id`` is a UUID minted by the
+    service, not a name the caller chooses."""
+
+    account_id: str
     name: str
-    created_by: str
-    created_at: str
-    known_emails: list[str] = field(default_factory=list)
+    description: str = ""
+    app_type: str = "other"
+    app_url: str = ""
+    enabled: bool = True
+    legacy_account_id: str = ""
+    created_by: str = ""
+    created_at: str = ""
+    updated_at: str | None = None
 
 
 class AuthServiceError(Exception):
     """Raised when the auth service returns a non-2xx response.
 
-    ``status_code``: 401 bad credentials/invalid or revoked token, 403 not
-    platform staff, 409 email already registered or self-join by an
-    already-assigned user, 422 malformed input, 404 organization/user not
-    found.
+    ``status_code``: 401 bad credentials/invalid or revoked token, 403 not an
+    administrator or a disabled application, 409 email already registered, 422
+    malformed input, 404 app account/user not found.
     """
 
     def __init__(self, status_code: int, message: str, code: str = "") -> None:
@@ -82,7 +122,8 @@ def _user_from_dict(d: dict[str, Any]) -> UserPublic:
         user_id=d["user_id"],
         email=d["email"],
         name=d["name"],
-        org_id=d.get("org_id"),
+        accounts=[LoginAccount(**a) for a in d.get("accounts", [])],
+        is_admin=bool(d.get("is_admin", False)),
         created_at=d.get("created_at"),
     )
 
@@ -116,14 +157,14 @@ class AuthServiceClient:
     # ------------------------------------------------------------- identity
 
     async def register(
-        self, email: str, name: str, password: str, org_id: str | None = None
+        self, email: str, name: str, password: str, account_id: str | None = None
     ) -> TokenResponse:
-        """Register a new user. Pass ``org_id`` (from ``register_organization``)
+        """Register a new user. Pass ``account_id`` (an app account's UUID)
         to join that organization immediately; omit it to sign up as a guest
         and join one later via ``join_organization``."""
         payload: dict[str, Any] = {"email": email, "name": name, "password": password}
-        if org_id is not None:
-            payload["org_id"] = org_id
+        if account_id is not None:
+            payload["account_id"] = account_id
         r = await self._client.post("/auth/register", json=payload)
         _raise_for_error(r)
         d = r.json()
@@ -144,7 +185,6 @@ class AuthServiceClient:
         return TokenResponse(
             access_token=d["access_token"],
             user=_user_from_dict(d["user"]),
-            account_id=d.get("account_id"),
         )
 
     async def me(self, token: str) -> UserPublic:
@@ -158,66 +198,90 @@ class AuthServiceClient:
 
     # ------------------------------------------------ organization self-service
 
-    async def register_organization(self, name: str) -> OrganizationRecord:
-        """Self-serve organization creation — no token required. Returns the
-        new org_id to hand out at signup or pass to ``join_organization``."""
-        r = await self._client.post("/auth/organizations/register", json={"name": name})
-        _raise_for_error(r)
-        return OrganizationRecord(**r.json())
+    async def select_account(self, token: str, account_id: str) -> TokenResponse:
+        """Re-scope the caller's token to another of their own app accounts.
 
-    async def join_organization(self, token: str, org_id: str) -> TokenResponse:
-        """Attach the caller's own (still-guest) account to an organization.
-
-        Only succeeds while the account is unassigned — raises
-        ``AuthServiceError(409)`` once it already belongs to one. Returns a
-        fresh token carrying the new org_id claim.
+        The second half of a multi-account sign-in: the account is a token
+        claim (downstream services scope data on it), so switching means a new
+        token rather than a client-side flag. 403 if the user doesn't belong to
+        that account or it is disabled.
         """
         r = await self._client.post(
-            "/auth/me/organization", json={"org_id": org_id}, headers=self._auth_headers(token)
+            "/auth/me/account",
+            json={"account_id": account_id},
+            headers=self._auth_headers(token),
         )
         _raise_for_error(r)
         d = r.json()
-        return TokenResponse(access_token=d["access_token"], user=_user_from_dict(d["user"]))
+        return TokenResponse(
+            access_token=d["access_token"],
+            token_type=d.get("token_type", "bearer"),
+            user=_user_from_dict(d["user"]),
+        )
 
-    # -------------------------------------------------- organization admin
-    # Platform-staff only (403 otherwise) — see features/organization.py.
+    # ---------------------------------------------------------------- accounts
+    # Registered applications. Administrators only.
 
-    async def create_organization(self, token: str, name: str) -> OrganizationRecord:
+    async def create_account(
+        self,
+        token: str,
+        name: str,
+        description: str = "",
+        app_type: str = "other",
+        app_url: str = "",
+    ) -> AppAccountRecord:
+        """Register an application; the service mints its ``account_id``.
+
+        The returned UUID is the value that application must send as
+        ``account_id`` at login — put it in that application's configuration.
+        """
         r = await self._client.post(
-            "/auth/organizations", json={"name": name}, headers=self._auth_headers(token)
+            "/auth/accounts",
+            json={
+                "name": name,
+                "description": description,
+                "app_type": app_type,
+                "app_url": app_url,
+            },
+            headers=self._auth_headers(token),
         )
         _raise_for_error(r)
-        return OrganizationRecord(**r.json())
+        return AppAccountRecord(**r.json())
 
-    async def rename_organization(self, token: str, org_id: str, name: str) -> OrganizationRecord:
-        r = await self._client.patch(
-            f"/auth/organizations/{org_id}", json={"name": name}, headers=self._auth_headers(token)
+    async def list_accounts(self, token: str) -> list[AppAccountRecord]:
+        r = await self._client.get("/auth/accounts", headers=self._auth_headers(token))
+        _raise_for_error(r)
+        return [AppAccountRecord(**a) for a in r.json()]
+
+    async def get_account(self, token: str, account_id: str) -> AppAccountRecord:
+        r = await self._client.get(
+            f"/auth/accounts/{account_id}", headers=self._auth_headers(token)
         )
         _raise_for_error(r)
-        return OrganizationRecord(**r.json())
+        return AppAccountRecord(**r.json())
 
-    async def delete_organization(self, token: str, org_id: str) -> None:
-        """Raises AuthServiceError(409) if the organization still has member
-        users, or (403) for the reserved system organizations."""
+    async def delete_account(self, token: str, account_id: str) -> None:
         r = await self._client.delete(
-            f"/auth/organizations/{org_id}", headers=self._auth_headers(token)
+            f"/auth/accounts/{account_id}", headers=self._auth_headers(token)
         )
         _raise_for_error(r)
-
-    async def list_organizations(self, token: str) -> list[OrganizationRecord]:
-        r = await self._client.get("/auth/organizations", headers=self._auth_headers(token))
-        _raise_for_error(r)
-        return [OrganizationRecord(**o) for o in r.json()]
 
     async def list_users(self, token: str) -> list[UserPublic]:
         r = await self._client.get("/auth/users", headers=self._auth_headers(token))
         _raise_for_error(r)
         return [_user_from_dict(u) for u in r.json()]
 
-    async def assign_user_organization(self, token: str, user_id: str, org_id: str) -> UserPublic:
+    async def assign_user_accounts(
+        self, token: str, user_id: str, account_id: str | None, account_ids: list[str] | None = None
+    ) -> UserPublic:
+        """Set which applications a user may sign in through (admin only).
+
+        ``account_id`` is their default — what a login naming no account gets;
+        ``account_ids`` are the extras that make an account picker appear.
+        """
         r = await self._client.patch(
-            f"/auth/users/{user_id}/organization",
-            json={"org_id": org_id},
+            f"/auth/users/{user_id}/accounts",
+            json={"account_id": account_id, "account_ids": account_ids or []},
             headers=self._auth_headers(token),
         )
         _raise_for_error(r)

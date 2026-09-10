@@ -9,6 +9,8 @@ verbatim, so an existing ``.env`` value copies straight across):
     AUTH_ACCESS_TTL_MINUTES   — access-token lifetime in minutes, default 60
     AUTH_MONGO_URI            — falls back to bare MONGO_URI when unset
     AUTH_MONGO_DB_NAME        — falls back to bare MONGO_DB_NAME, default "app"
+    AUTH_ADMIN_ACCOUNT_ID     — the admin app account's UUID; defaults to the
+                                value derived from the "richminds" slug
 
 This module — and only this module — owns *what* the service authenticates
 against (secret, token lifetime, storage, admin account). ``app/config.py``
@@ -22,6 +24,8 @@ from pathlib import Path
 
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from .account_ids import ADMIN_ACCOUNT_UUID
 
 _ROOT = Path(__file__).parent.parent
 
@@ -86,7 +90,17 @@ class AuthSettings(BaseSettings):
     # Administering this service (app accounts) is gated on membership of ONE
     # app account — the RichMinds admin application. A user whose
     # UserRecord.account_id equals this value is an admin; nobody else is.
-    admin_account_id: str = Field(default="richminds", validation_alias="AUTH_ADMIN_ACCOUNT_ID")
+    #
+    # Account IDs are UUIDs, so this default cannot be a readable slug any
+    # more. It is DERIVED from the old "richminds" slug rather than random
+    # (features/account_ids.py) precisely so a default is possible: the admin
+    # account is created at startup, and a randomly minted ID would leave a
+    # fresh deployment with no administrator until someone read the value out
+    # of Mongo. Derivation also makes a migrated database and a freshly
+    # bootstrapped one agree on the value.
+    admin_account_id: str = Field(
+        default=ADMIN_ACCOUNT_UUID, validation_alias="AUTH_ADMIN_ACCOUNT_ID"
+    )
 
     @property
     def jwt_secret_is_default(self) -> bool:
