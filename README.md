@@ -264,14 +264,48 @@ llm-gateway only check signature, issuer, audience and expiry.
 **So a logged-out (or deleted, or disabled) user keeps working against those
 services until their token expires.** The exposure window is exactly
 `AUTH_ACCESS_TTL_MINUTES` — which is why it defaults to **60 minutes** rather
-than something more convenient. There is no refresh token, so lengthening it
-buys fewer re-logins at the cost of slower revocation; shortening it does the
-reverse.
+than something more convenient.
+
+`POST /auth/refresh-token` is what keeps that short TTL affordable. Without it
+the only way to avoid signing people out every hour would be to lengthen the
+token lifetime for everyone, trading revocation speed for convenience; with it,
+tokens stay short-lived and an active client exchanges quietly in the
+background. See **Refreshing a token** below.
 
 If instant revocation is ever required downstream, the options are the usual
 ones, and both give up the "no hop" property: have those services call
 `GET /auth/me` (or a dedicated introspection endpoint) per request, or share
 the revocation list through a cache both sides read.
+
+### Refreshing a token
+
+```http
+POST /auth/refresh-token
+Authorization: Bearer <a possibly-expired access token>
+```
+
+Returns the same `TokenResponse` login does. This is the **only** endpoint that
+accepts an expired token, and five checks fence that in — each one load-bearing:
+
+| check | why |
+|---|---|
+| signature, issuer, audience | only expiry is waived, nothing else |
+| not revoked | otherwise a token discarded at logout could be exchanged for a live one, and logout would mean nothing |
+| within `AUTH_REFRESH_TTL_MINUTES` of `iat` | expiry is waived, so this is the only bound on staleness — without it a token from an old log would still work |
+| user still exists | re-read, so a deleted user cannot renew, and the new token carries their *current* email, name and account |
+| old token revoked (rotation) | each token is exchangeable exactly once: a stolen one buys a single refresh, and spending it breaks the real user's next refresh visibly rather than sharing a session silently |
+
+Every failure is `401` without saying which check failed — the caller's only
+useful response is to sign in again, and distinguishing "revoked" from "too old"
+would tell an attacker holding a token something about its history.
+
+The window is measured from `iat`, not `exp`, so it is an **idle timeout that
+slides**: an active session never reaches it, an abandoned one does.
+
+**Behind the API gateway this path must be public** (`GATEWAY_PUBLIC_PATHS`
+carries `POST:/auth/refresh-token`). The gateway validates tokens by calling
+`GET /auth/me`, which refuses an expired one — so gating it would 401 every
+refresh before this service ever saw it.
 
 ## Administration
 

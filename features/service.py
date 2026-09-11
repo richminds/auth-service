@@ -25,7 +25,7 @@ import re
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from .blacklist import revoke_token
+from .blacklist import is_token_revoked, revoke_token
 from .repository import DuplicateUserError, get_repository
 from .schemas import (
     LoginAccount,
@@ -38,6 +38,7 @@ from .schemas import (
 from .security import (
     create_access_token,
     decode_token,
+    decode_token_ignoring_expiry,
     hash_password,
     needs_rehash,
     verify_password,
@@ -410,6 +411,92 @@ async def logout(token: str, user_id: str) -> None:
         logger.info("Auth: user %s logged out (token revoked)", user_id)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Auth: logout for user %s could not revoke token: %s", user_id, exc)
+
+
+async def refresh_token(token: str) -> TokenResponse:
+    """Exchange a recently-expired access token for a fresh one.
+
+    Access tokens are deliberately short-lived (``AUTH_ACCESS_TTL_MINUTES``,
+    an hour) because that interval IS the revocation latency — a logged-out
+    token keeps working for at most that long. Without this endpoint the only
+    way to keep a session alive would be to lengthen that window for everyone,
+    trading revocation speed for convenience. This separates the two: tokens
+    stay short-lived, and an active client exchanges quietly.
+
+    Five checks, and each one is load-bearing:
+
+    1. Signature, issuer and audience must verify. Only expiry is waived
+       (``decode_token_ignoring_expiry``) — the whole point is that the token
+       has probably expired.
+    2. The token must not be REVOKED. This is what makes logout final: without
+       it a token discarded at sign-out could be exchanged for a live one, and
+       logging out would mean nothing.
+    3. The token must be within the refresh window (``AUTH_REFRESH_TTL_MINUTES``
+       from ``iat``). Since expiry is waived, this is the only thing bounding
+       how stale a token may be — otherwise one recovered from a log a year
+       later would still work. A window of 0 disables refresh altogether.
+    4. The user record must still exist. It is re-read rather than trusted from
+       the claims, so a deleted user's token cannot be renewed, and the new
+       token carries their CURRENT email, name and account rather than
+       whatever was true when they signed in.
+    5. The old token is REVOKED before the new one is issued — rotation. Each
+       token is therefore exchangeable exactly once. A stolen token buys one
+       refresh at most, and if the attacker spends it the legitimate user's
+       next exchange fails and forces a visible re-login, rather than the two
+       of them sharing a session indefinitely.
+
+    Every failure raises InvalidCredentialsError → 401, deliberately without
+    saying which check failed: the caller's only useful response is to sign in
+    again, and distinguishing "expired too long ago" from "revoked" would tell
+    an attacker holding a token something about its history.
+    """
+    # Imported inside the function, as _role_for and register do — this module
+    # is imported by config-adjacent code and keeps the dependency one-way.
+    from .config import auth_settings
+
+    if not token:
+        raise InvalidCredentialsError("No token supplied")
+
+    if auth_settings.refresh_ttl_minutes <= 0:
+        raise InvalidCredentialsError("Token refresh is disabled")
+
+    try:
+        claims = decode_token_ignoring_expiry(token)
+    except Exception as exc:  # noqa: BLE001 — any decode failure is a 401
+        raise InvalidCredentialsError("Invalid token") from exc
+
+    jti = claims.get("jti")
+    if await is_token_revoked(jti):
+        raise InvalidCredentialsError("Token is no longer valid")
+
+    issued_at = claims.get("iat")
+    if not issued_at:
+        # Every token this service mints carries iat; one without it predates
+        # the claim or was not minted here, and either way there is nothing to
+        # measure the refresh window against.
+        raise InvalidCredentialsError("Token cannot be refreshed")
+
+    age_seconds = datetime.now(timezone.utc).timestamp() - float(issued_at)
+    if age_seconds > auth_settings.refresh_ttl_minutes * 60:
+        raise InvalidCredentialsError("Token is too old to refresh")
+
+    user = await get_repository().get_by_id(str(claims.get("sub")))
+    if user is None:
+        raise InvalidCredentialsError("Token cannot be refreshed")
+
+    # Rotation, BEFORE the new token exists so a failure here cannot leave two
+    # usable tokens. The TTL is the remaining refresh window rather than the
+    # token's own exp, which is in the past — see features/blacklist.py.
+    if jti:
+        remaining = int(auth_settings.refresh_ttl_minutes * 60 - age_seconds)
+        await revoke_token(jti, claims.get("exp", 0), ttl_seconds=remaining)
+
+    logger.info("Auth: refreshed token for %s", user.user_id)
+    # Scoped to the account the OLD token named, so a refresh never silently
+    # moves the session to a different application — the user picked that with
+    # POST /auth/me/account and refreshing is not a place to change it.
+    accounts = await _login_accounts(await accounts_for_email(user.email))
+    return _token_for(user, account_id=claims.get("account_id"), accounts=accounts)
 
 
 async def get_user(user_id: str, scoped_account_id: str | None = None) -> UserPublic | None:

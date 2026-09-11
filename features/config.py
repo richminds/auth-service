@@ -45,6 +45,23 @@ class AuthSettings(BaseSettings):
     # TTL bounds it further). Kept short for that reason; there is no refresh
     # token, so raising it trades revocation latency for fewer re-logins.
     access_ttl_minutes: int = Field(default=60, validation_alias="AUTH_ACCESS_TTL_MINUTES")
+
+    refresh_ttl_minutes: int = Field(
+        default=10080, validation_alias="AUTH_REFRESH_TTL_MINUTES"
+    )
+    """How long after it was ISSUED a token may still be exchanged at
+    ``POST /auth/refresh-token``. Seven days by default.
+
+    This is the idle timeout, not the session length: each refresh mints a token
+    with a fresh ``iat``, so an active user's window keeps sliding and only an
+    absence longer than this forces a new sign-in. That is what lets
+    ``access_ttl_minutes`` stay short — an hour of revocation latency — without
+    signing people out every hour.
+
+    It is also the bound on the one property refresh gives up. The endpoint
+    accepts an expired token, so without this a token found in a log a year
+    later would still be exchangeable. 0 disables refresh entirely: every
+    exchange is refused and clients fall back to signing in again."""
     # This service is the trust root for end-user identity (sub, account_id),
     # and now the ONLY holder of the signing key: llm-gateway and
     # knowledge-service no longer validate tokens themselves — the api-gateway

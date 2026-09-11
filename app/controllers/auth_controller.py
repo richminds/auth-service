@@ -185,6 +185,30 @@ async def logout(request: Request, user: AuthUser = Depends(get_current_user)) -
 # below and nowhere else.
 # ---------------------------------------------------------------------------
 
+@router.post("/refresh-token", response_model=TokenResponse)
+async def refresh_token(request: Request) -> TokenResponse:
+    """Exchange a recently-expired access token for a fresh one.
+
+    The ONLY endpoint here that does not depend on ``get_current_user`` — that
+    dependency rejects an expired token, and an expired token is precisely what
+    this is for. The bearer header is read directly instead, exactly as logout
+    reads it, and every other check lives in ``service.refresh_token``: the
+    signature, the revocation list, the refresh window, that the user still
+    exists, and rotation of the old token.
+
+    Added so that applications with short access tokens do not have to choose
+    between signing users out every hour and lengthening the token lifetime for
+    everyone — that lifetime IS this service's revocation latency.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    token = (
+        auth_header.split(" ", 1)[1].strip()
+        if auth_header.lower().startswith("bearer ")
+        else ""
+    )
+    return await service.refresh_token(token)
+
+
 @router.get("/users", response_model=list[UserPublic])
 async def list_users(_: AuthUser = Depends(require_admin)) -> list[UserPublic]:
     """List every user RECORD, including the account membership behind it.

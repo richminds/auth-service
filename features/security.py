@@ -155,3 +155,28 @@ def decode_token(token: str) -> dict[str, Any]:
         issuer=auth_settings.jwt_issuer,
         audience=auth_settings.jwt_audience,
     )
+
+
+def decode_token_ignoring_expiry(token: str) -> dict[str, Any]:
+    """As ``decode_token``, but an EXPIRED token still decodes.
+
+    Only for ``POST /auth/refresh-token``, whose entire purpose is to accept a
+    token that has just expired. Every other check still applies — signature,
+    issuer and audience — so this weakens exactly one property and nothing
+    else. It is deliberately a separate function rather than a flag on
+    ``decode_token``: a boolean argument that disables expiry checking is one
+    mistaken ``True`` away from making every endpoint accept dead tokens,
+    whereas a distinct name shows up in review and in grep.
+
+    Expiry is not simply ignored by the caller either — features/service.py's
+    ``refresh_token`` bounds how stale a token may be (``AUTH_REFRESH_TTL_MINUTES``)
+    and revokes it once used, so this is a narrower door, not an open one.
+    """
+    return jwt.decode(
+        token,
+        auth_settings.jwt_secret,
+        algorithms=[auth_settings.jwt_algorithm],
+        issuer=auth_settings.jwt_issuer,
+        audience=auth_settings.jwt_audience,
+        options={"verify_exp": False},
+    )
