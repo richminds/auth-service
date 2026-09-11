@@ -326,3 +326,74 @@ class UpdateAppAccountRequest(BaseModel):
     def _check_url(cls, v: str | None) -> str | None:
         return None if v is None else _validate_app_url(v)
 
+
+
+# ---------------------------------------------------------------------------
+# Password reset
+# ---------------------------------------------------------------------------
+
+class PasswordResetTokenRecord(BaseModel):
+    """One issued reset token.
+
+    The raw token is NEVER stored — only its SHA-256 hash, so a dump of this
+    collection cannot be replayed to take over accounts. The raw value exists
+    exactly twice: in the email, and in the request that redeems it.
+
+    ``user_id`` is what the token actually binds to, not the email. Users here
+    are keyed on (email, account_id), so an email alone does not identify a
+    record; binding to the resolved user_id is what keeps a reset started from
+    one application from touching that person's records in another. ``email``
+    and ``account_id`` are carried alongside for logging and so a revoked
+    account can be spotted without a second lookup.
+    """
+
+    token_hash: str
+    user_id: str
+    email: str
+    account_id: str | None = None
+    expires_at: datetime
+    created_at: datetime
+    used_at: datetime | None = None
+    """Set when redeemed. A used token is kept rather than deleted so a second
+    attempt can be told apart from an expired or forged one — the distinction
+    is a better error message, not a security boundary."""
+
+
+class ForgotPasswordRequest(BaseModel):
+    """Start a reset.
+
+    ``account_id`` is required, unlike makemerich's port of this flow, because
+    one email may back several records with independent passwords. Without it
+    the service would have to guess which application's password the caller
+    means, and guessing wrong silently changes the password for an unrelated
+    product.
+    """
+
+    email: str = Field(min_length=3, max_length=200)
+    account_id: str = Field(min_length=1, max_length=200)
+
+
+class ForgotPasswordResponse(BaseModel):
+    """Always the same generic message, whether or not the email is known.
+
+    This is the whole anti-enumeration property of the endpoint: an
+    unauthenticated caller must not be able to use it to discover which
+    addresses are registered, or which applications an address belongs to.
+    """
+
+    message: str
+    debug_token: str | None = None
+    """The raw token, returned ONLY when SMTP is unconfigured AND
+    AUTH_EXPOSE_RESET_TOKEN is on — a development affordance so the flow can
+    be exercised without a mail server. Never populated in production."""
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(min_length=8, max_length=512)
+    new_password: str = Field(min_length=6, max_length=200)
+    """Minimum matches RegisterRequest.password, so a reset cannot be used to
+    set a password that registration would have rejected."""
+
+
+class ResetPasswordResponse(BaseModel):
+    message: str

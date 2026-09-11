@@ -25,13 +25,14 @@ from enum import Enum
 from typing import Protocol, runtime_checkable
 
 from .config import auth_settings
-from .schemas import AppAccountRecord, UserRecord
+from .schemas import AppAccountRecord, PasswordResetTokenRecord, UserRecord
 
 logger = logging.getLogger(__name__)
 
 _user_repository: "UserRepository | None" = None
 _revocation_repository: "RevocationRepository | None" = None
 _app_account_repository: "AppAccountRepository | None" = None
+_password_reset_repository: "PasswordResetRepository | None" = None
 
 
 class DuplicateUserError(Exception):
@@ -86,6 +87,21 @@ class AppAccountRepository(Protocol):
     async def list_all(self) -> list[AppAccountRecord]: ...
     async def update(self, account_id: str, changes: dict) -> AppAccountRecord | None: ...
     async def delete(self, account_id: str) -> bool: ...
+
+
+@runtime_checkable
+class PasswordResetRepository(Protocol):
+    """Issued password-reset tokens, keyed on the SHA-256 hash of the raw token.
+
+    Keyed on the hash rather than an id because that is the only thing a
+    redemption request can present: the client holds the raw token, hashes are
+    what we stored, and looking one up IS the authentication step.
+    """
+
+    async def create(self, record: PasswordResetTokenRecord) -> None: ...
+    async def get_by_hash(self, token_hash: str) -> PasswordResetTokenRecord | None: ...
+    async def mark_used(self, token_hash: str, used_at: datetime) -> None: ...
+    async def invalidate_for_user(self, user_id: str, used_at: datetime) -> int: ...
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +197,34 @@ class InMemoryAppAccountRepository:
 
     async def delete(self, account_id: str) -> bool:
         return self._by_id.pop(account_id, None) is not None
+
+
+class InMemoryPasswordResetRepository:
+    """Process-local mirror. Expiry is enforced by the service layer reading
+    ``expires_at``, not by eviction, so an expired token can still be found and
+    reported as expired rather than as invalid."""
+
+    def __init__(self) -> None:
+        self._by_hash: dict[str, PasswordResetTokenRecord] = {}
+
+    async def create(self, record: PasswordResetTokenRecord) -> None:
+        self._by_hash[record.token_hash] = record
+
+    async def get_by_hash(self, token_hash: str) -> PasswordResetTokenRecord | None:
+        return self._by_hash.get(token_hash)
+
+    async def mark_used(self, token_hash: str, used_at: datetime) -> None:
+        record = self._by_hash.get(token_hash)
+        if record is not None:
+            self._by_hash[token_hash] = record.model_copy(update={"used_at": used_at})
+
+    async def invalidate_for_user(self, user_id: str, used_at: datetime) -> int:
+        count = 0
+        for token_hash, record in list(self._by_hash.items()):
+            if record.user_id == user_id and record.used_at is None:
+                self._by_hash[token_hash] = record.model_copy(update={"used_at": used_at})
+                count += 1
+        return count
 
 
 class InMemoryRevocationRepository:
@@ -379,6 +423,44 @@ class MongoAppAccountRepository:
         return result.deleted_count > 0
 
 
+class MongoPasswordResetRepository:
+    """TTL-indexed on ``expires_at`` so redeemed and abandoned tokens both age
+    out on their own. The index is created once in init_repository().
+
+    Mongo's TTL monitor runs about once a minute, so a token can outlive its
+    ``expires_at`` in the collection by up to that long. Expiry is therefore
+    ALSO checked in the service layer against the stored timestamp — the index
+    is housekeeping, not the security control.
+    """
+
+    def __init__(self, col) -> None:
+        self._col = col
+
+    async def create(self, record: PasswordResetTokenRecord) -> None:
+        doc = record.model_dump(mode="json")
+        doc["email"] = doc["email"].strip().lower()
+        await self._col.insert_one(doc)
+
+    async def get_by_hash(self, token_hash: str) -> PasswordResetTokenRecord | None:
+        d = await self._col.find_one({"token_hash": token_hash})
+        if d is None:
+            return None
+        d.pop("_id", None)
+        return PasswordResetTokenRecord(**d)
+
+    async def mark_used(self, token_hash: str, used_at: datetime) -> None:
+        await self._col.update_one(
+            {"token_hash": token_hash}, {"$set": {"used_at": used_at.isoformat()}}
+        )
+
+    async def invalidate_for_user(self, user_id: str, used_at: datetime) -> int:
+        result = await self._col.update_many(
+            {"user_id": user_id, "used_at": None},
+            {"$set": {"used_at": used_at.isoformat()}},
+        )
+        return result.modified_count
+
+
 class MongoRevocationRepository:
     """TTL-indexed collection — a revoked entry expires at the same moment the
     token itself would have stopped being valid anyway, so it never grows
@@ -463,6 +545,7 @@ async def init_repository() -> None:
     """Initialise the process-wide repositories. Idempotent-ish: safe to call
     once at startup; falls back to in-memory storage on any Mongo failure."""
     global _user_repository, _revocation_repository, _app_account_repository
+    global _password_reset_repository
 
     if not auth_settings.mongo_uri:
         logger.warning(
@@ -472,6 +555,7 @@ async def init_repository() -> None:
         _user_repository = InMemoryUserRepository()
         _revocation_repository = InMemoryRevocationRepository()
         _app_account_repository = InMemoryAppAccountRepository()
+        _password_reset_repository = InMemoryPasswordResetRepository()
         return
 
     try:
@@ -497,12 +581,21 @@ async def init_repository() -> None:
         ])
         _app_account_repository = MongoAppAccountRepository(app_accounts_col)
 
+        reset_col = conn.get_collection(auth_settings.password_reset_tokens_collection)
+        await reset_col.create_indexes([
+            IndexModel([("token_hash", ASCENDING)], unique=True, name="token_hash_unique"),
+            IndexModel([("user_id", ASCENDING)], name="user_id"),
+            IndexModel([("expires_at", ASCENDING)], expireAfterSeconds=0, name="ttl_expires_at"),
+        ])
+        _password_reset_repository = MongoPasswordResetRepository(reset_col)
+
         logger.info("Auth repository: MongoDB (db=%s)", conn.db_name)
     except Exception as exc:  # noqa: BLE001
         logger.error("Auth: MongoDB connection failed (%s) — falling back to in-memory.", exc)
         _user_repository = InMemoryUserRepository()
         _revocation_repository = InMemoryRevocationRepository()
         _app_account_repository = InMemoryAppAccountRepository()
+        _password_reset_repository = InMemoryPasswordResetRepository()
 
 
 async def close_repository() -> None:
@@ -527,3 +620,9 @@ def get_app_account_repository() -> AppAccountRepository:
     if _app_account_repository is None:
         raise RuntimeError("Auth repository not initialised — call init_repository() at startup.")
     return _app_account_repository
+
+def get_password_reset_repository() -> PasswordResetRepository:
+    if _password_reset_repository is None:
+        raise RuntimeError("Auth repository not initialised — call init_repository() at startup.")
+    return _password_reset_repository
+

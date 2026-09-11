@@ -101,6 +101,41 @@ class AuthSettings(BaseSettings):
         default=ADMIN_ACCOUNT_UUID, validation_alias="AUTH_ADMIN_ACCOUNT_ID"
     )
 
+    # ---------------------------------------------------------- password reset
+    # Ported from makemerich-backend, which is the implementation this service
+    # replaces. Names are prefixed AUTH_ to match the rest of this file rather
+    # than copied verbatim, because SMTP_* would collide with any other
+    # service sharing an environment.
+    password_reset_tokens_collection: str = "password_reset_tokens"
+    password_reset_ttl_minutes: int = Field(
+        default=30, validation_alias="AUTH_PASSWORD_RESET_TTL_MINUTES"
+    )
+    # Fallback link base, used ONLY when the app account being reset has no
+    # app_url of its own. The per-account URL is the primary source (see
+    # features/password_reset.py::_reset_link) — one auth-service serves
+    # several frontends, so a single global URL cannot be right for all of
+    # them. Leave empty and the flow refuses to send rather than mailing a
+    # broken link.
+    password_reset_url: str = Field(default="", validation_alias="AUTH_PASSWORD_RESET_URL")
+    # Returns the raw token in the HTTP response when SMTP is unconfigured, so
+    # the flow is testable without a mail server. NEVER enable in production:
+    # it hands anyone who can guess an email a working reset link.
+    expose_reset_token: bool = Field(
+        default=False, validation_alias="AUTH_EXPOSE_RESET_TOKEN"
+    )
+
+    # --------------------------------------------------------------------- SMTP
+    # Unset host or from-address means "not configured": messages are logged
+    # instead of sent (features/email.py). That is a legitimate dev mode and a
+    # silent production outage, so app/main.py warns about it at startup.
+    smtp_host: str = Field(default="", validation_alias="AUTH_SMTP_HOST")
+    smtp_port: int = Field(default=587, validation_alias="AUTH_SMTP_PORT")
+    smtp_username: str = Field(default="", validation_alias="AUTH_SMTP_USERNAME")
+    smtp_password: str = Field(default="", validation_alias="AUTH_SMTP_PASSWORD")
+    smtp_from_email: str = Field(default="", validation_alias="AUTH_SMTP_FROM_EMAIL")
+    smtp_from_name: str = Field(default="RichMinds", validation_alias="AUTH_SMTP_FROM_NAME")
+    smtp_use_tls: bool = Field(default=True, validation_alias="AUTH_SMTP_USE_TLS")
+
     @property
     def jwt_secret_is_default(self) -> bool:
         return self.jwt_secret == "dev-secret-change-me"

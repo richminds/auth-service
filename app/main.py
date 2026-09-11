@@ -27,6 +27,8 @@ from features.repository import close_repository, init_repository
 from .config import service_settings
 from .controllers import auth_controller, health_controller
 from .errors import register_exception_handlers
+from features.email import smtp_configured
+
 from .logging_config import configure_logging
 from .middleware.request_context import RequestContextMiddleware
 
@@ -52,10 +54,32 @@ def _warn_on_insecure_secret() -> None:
         logger.warning(message)
 
 
+def _warn_on_unconfigured_smtp() -> None:
+    """Password reset silently does nothing without SMTP.
+
+    POST /auth/forgot-password always answers 200 with the same message so it
+    can't be used to enumerate addresses — which means an unconfigured mailer
+    is indistinguishable, to the user, from a working one. The only place that
+    difference can surface is here.
+    """
+    if smtp_configured():
+        return
+    message = (
+        "AUTH_SMTP_HOST/AUTH_SMTP_FROM_EMAIL are unset — password-reset emails "
+        "will be logged instead of sent, and POST /auth/forgot-password will "
+        "still answer 200. Nobody can complete a reset."
+    )
+    if service_settings.is_production:
+        logger.error("!!! %s", message)
+    else:
+        logger.warning(message)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     configure_logging(service_settings.log_level, service_settings.log_format)
     _warn_on_insecure_secret()
+    _warn_on_unconfigured_smtp()
 
     await init_repository()
 

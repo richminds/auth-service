@@ -11,6 +11,7 @@ framework-free and importable in-process.
     AccountNotAllowedError    → 403  switching to an app account the user doesn't belong to
     AppAccountExistsError       → 409  registering an account_id that is taken
     AppAccountNotFoundError     → 404  reading/updating/deleting an unknown account_id
+    InvalidResetTokenError    → 400  reset link unknown, already used, or expired
 """
 from __future__ import annotations
 
@@ -26,6 +27,7 @@ from features.app_accounts import (
     AppAccountExistsError,
     AppAccountNotFoundError,
 )
+from features.password_reset import InvalidResetTokenError
 from features.service import (
     AccountNotAllowedError,
     EmailTakenError,
@@ -91,3 +93,10 @@ def register_exception_handlers(app: FastAPI) -> None:
         request: Request, exc: AppAccountNotFoundError
     ) -> JSONResponse:
         return _problem(request, 404, "app_account_not_found", str(exc))
+
+    @app.exception_handler(InvalidResetTokenError)
+    async def _invalid_reset_token(
+        request: Request, exc: InvalidResetTokenError
+    ) -> JSONResponse:
+        return _problem(request, 400, "invalid_reset_token", str(exc))
+

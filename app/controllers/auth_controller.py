@@ -8,15 +8,20 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Request, status
 
-from features import app_accounts, service
+from features import app_accounts, password_reset, service
+from features.config import auth_settings
 from features.dependencies import AuthUser, get_current_user, require_admin
 from features.schemas import (
     AppAccountRecord,
     AssignUserAccountsRequest,
     CreateAppAccountRequest,
+    ForgotPasswordRequest,
+    ForgotPasswordResponse,
     LoginAccount,
     LoginRequest,
     RegisterRequest,
+    ResetPasswordRequest,
+    ResetPasswordResponse,
     SelectAccountRequest,
     TokenResponse,
     UpdateAppAccountRequest,
@@ -68,6 +73,49 @@ async def login(payload: LoginRequest) -> TokenResponse:
         await app_accounts.assert_login_allowed(payload.account_id)
 
     return await service.login(payload)
+
+
+@router.post("/forgot-password", response_model=ForgotPasswordResponse)
+async def forgot_password(payload: ForgotPasswordRequest) -> ForgotPasswordResponse:
+    """Request a password-reset link for one application.
+
+    Always 200 with the same message, whether or not that email has a record
+    in that application. An unauthenticated caller must not be able to use
+    this to discover which addresses are registered, or which applications an
+    address belongs to — the same reason login returns one error for both a
+    bad password and a missing record.
+
+    ``account_id`` is required: users are keyed on (email, account_id) with a
+    password hash per record, so the address alone does not say which password
+    is being reset (features/password_reset.py).
+    """
+    _, debug_token = await password_reset.request_password_reset(
+        payload.email, payload.account_id
+    )
+
+    response = ForgotPasswordResponse(
+        message="If an account exists for that email, a password reset link has been sent.",
+    )
+    # Only when the mail never went out AND the operator opted in. Both halves
+    # matter: the first means there is no other way to obtain the token, the
+    # second is the acknowledgement that this is a development-only affordance.
+    if debug_token and auth_settings.expose_reset_token:
+        response.debug_token = debug_token
+    return response
+
+
+@router.post("/reset-password", response_model=ResetPasswordResponse)
+async def reset_password(payload: ResetPasswordRequest) -> ResetPasswordResponse:
+    """Redeem a reset token and set a new password.
+
+    400 (``invalid_reset_token``) if the link is unknown, already used, or
+    expired — the message distinguishes them, the status does not. Rewrites
+    exactly the one record the token was minted for.
+    """
+    await password_reset.reset_password(payload.token, payload.new_password)
+    return ResetPasswordResponse(
+        message="Password reset successful. You can now sign in with your new password."
+    )
 
 
 @router.post("/me/account", response_model=TokenResponse)
