@@ -1,9 +1,8 @@
 """Password hashing across schemes.
 
 The point of supporting two: a user imported from an application that already
-stores bcrypt (makemerich-backend) can sign in with their existing hash — no
-password reset — and gets migrated to this service's current scheme on that
-first successful login.
+stores bcrypt can sign in with their existing hash — no password reset — and
+gets migrated to this service's current scheme on that first successful login.
 """
 from __future__ import annotations
 
@@ -44,7 +43,7 @@ def test_configured_cost_is_used():
 
 
 def test_verifies_a_hash_made_by_another_application():
-    """Exactly how makemerich-backend writes them: bcrypt.hashpw + gensalt."""
+    """How a plain bcrypt user writes them: bcrypt.hashpw + gensalt."""
     foreign = bcrypt.hashpw(b"hunter22", bcrypt.gensalt(rounds=12)).decode()
     assert verify_password("hunter22", foreign) is True
     assert verify_password("nope", foreign) is False
@@ -69,7 +68,7 @@ def test_malformed_stored_hash_is_a_failed_login_not_a_crash(junk):
 
 
 def test_long_passwords_are_trimmed_like_the_source_application():
-    """bcrypt caps at 72 bytes and makemerich-backend trims before hashing;
+    """bcrypt caps at 72 bytes, so a source application trims before hashing;
     trimming differently would fail to verify imported hashes."""
     long_password = "a" * 100
     stored = hash_password(long_password)

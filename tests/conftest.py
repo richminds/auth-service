@@ -1,8 +1,10 @@
 """Shared fixtures.
 
 There is no platform-staff allowlist any more: "administrator" means
-membership of the admin app account (AUTH_ADMIN_ACCOUNT_ID), which is a fact
-about the user's own record. ``admin_token`` below is the only way to get one.
+membership of an admin-type app account (app_type == "admin"), which is a
+fact about the account the user's record belongs to. ``admin_token`` below is
+the only way to get one, and ``admin_account_id`` the only way to learn that
+account's ID — it is minted per store, so there is no constant to import.
 
 Every test runs against in-memory repositories — the suite never touches a
 real MongoDB and never needs credentials. With AUTH_MONGO_URI unset,
@@ -36,17 +38,6 @@ def client():
     user/organization/revocation store via the lifespan's init_repository()."""
     with TestClient(app) as c:
         yield c
-
-
-from features.account_ids import ADMIN_ACCOUNT_UUID  # noqa: E402
-
-ADMIN_ACCOUNT_ID = ADMIN_ACCOUNT_UUID
-"""Mirrors auth_settings.admin_account_id — membership of this app account is
-what makes a user an administrator (features/dependencies.py::require_admin).
-
-Imported rather than written out so the suite tracks the derivation in
-features/account_ids.py instead of pinning a literal that would silently stop
-matching if the namespace ever changed."""
 
 
 def create_account(client, token: str, name: str, **fields) -> dict:
@@ -114,19 +105,35 @@ def run_async(coro):
     return _loop.run_until_complete(coro)
 
 
-def seed_admin_account() -> None:
-    """Create the admin app account, the way an operator does.
+def seed_admin_account() -> str:
+    """Create the admin app account, the way an operator does; return its ID.
 
     Starting the service no longer creates ANY account (app/main.py), so a
     fresh store has no admin account and registering into it 404s. This is the
-    test-suite equivalent of running scripts/seed_admin.py: it calls the same
-    ensure_admin_account() that script does, rather than reaching into a
+    test-suite equivalent of the operator's bootstrap step: it calls the same
+    ensure_admin_account() an operator does, rather than reaching into a
     repository, so the fixture exercises the real escape hatch instead of a
     shortcut the product does not have.
+
+    The ID is MINTED, so it differs per store — which is per test. Tests read
+    it from here (or from admin_account_id()) rather than from a constant.
     """
     from features.app_accounts import ensure_admin_account
 
-    run_async(ensure_admin_account())
+    return run_async(ensure_admin_account()).account_id
+
+
+def admin_account_id() -> str:
+    """The seeded admin account's ID in the current store.
+
+    Only meaningful after seed_admin_account() / admin_token() — before that
+    there is no admin account, and this fails loudly rather than guessing.
+    """
+    from features.app_accounts import admin_account_ids
+
+    ids = run_async(admin_account_ids())
+    assert len(ids) == 1, f"expected exactly one admin-type account, found {sorted(ids)}"
+    return next(iter(ids))
 
 
 def admin_token(client, email: str = "admin@richminds.io", password: str = "hunter22") -> str:
@@ -137,14 +144,14 @@ def admin_token(client, email: str = "admin@richminds.io", password: str = "hunt
     once per store (see service.register). Each test gets a fresh in-memory
     store, so this works once per test — call it before any other admin exists.
     """
-    seed_admin_account()
+    account_id = seed_admin_account()
     r = client.post(
         "/auth/register",
         json={
             "email": email,
             "name": "Admin",
             "password": password,
-            "account_id": ADMIN_ACCOUNT_ID,
+            "account_id": account_id,
         },
     )
     assert r.status_code == 201, r.text

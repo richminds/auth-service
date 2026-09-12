@@ -11,6 +11,7 @@ framework-free and importable in-process.
     AccountNotAllowedError    → 403  switching to an app account the user doesn't belong to
     AppAccountExistsError       → 409  registering an account_id that is taken
     AppAccountNotFoundError     → 404  reading/updating/deleting an unknown account_id
+    AdminAccountTypeFixedError  → 403  changing the admin account's app_type
     InvalidResetTokenError    → 400  reset link unknown, already used, or expired
 """
 from __future__ import annotations
@@ -23,6 +24,7 @@ from fastapi.responses import JSONResponse
 
 from features.app_accounts import (
     AdminAccountClosedError,
+    AdminAccountTypeFixedError,
     AppAccountDisabledError,
     AppAccountExistsError,
     AppAccountNotFoundError,
@@ -83,6 +85,12 @@ def register_exception_handlers(app: FastAPI) -> None:
         request: Request, exc: AdminAccountClosedError
     ) -> JSONResponse:
         return _problem(request, 403, "admin_account_closed", str(exc))
+
+    @app.exception_handler(AdminAccountTypeFixedError)
+    async def _admin_account_type_fixed(
+        request: Request, exc: AdminAccountTypeFixedError
+    ) -> JSONResponse:
+        return _problem(request, 403, "admin_account_type_fixed", str(exc))
 
     @app.exception_handler(AppAccountExistsError)
     async def _app_account_exists(request: Request, exc: AppAccountExistsError) -> JSONResponse:

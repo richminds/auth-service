@@ -1,22 +1,21 @@
 """Password reset — request a link, then redeem it.
 
-Ported from makemerich-backend's ``app/services/password_reset_service.py``,
-with two changes forced by the fact that this service backs several
-applications rather than one.
+The usual email-a-token flow, with two things a single-application service
+gets to skip and this one cannot, because it backs several applications.
 
-**1. A reset is scoped to ONE app account.** makemerich has a single user per
-email, so its flow could resolve a reset from the address alone. Here users
-are keyed on (email, account_id) with independent password hashes per record
-(features/schemas.py), so an email does not identify a record. The request
-therefore carries ``account_id``, the token binds to the resolved ``user_id``,
-and redeeming it rewrites exactly that one record's hash. A reset started from
-the knowledge console cannot change someone's password in an unrelated
-application.
+**1. A reset is scoped to ONE app account.** A single-application service has
+one user per email, so it can resolve a reset from the address alone. Here
+users are keyed on (email, account_id) with independent password hashes per
+record (features/schemas.py), so an email does not identify a record. The
+request therefore carries ``account_id``, the token binds to the resolved
+``user_id``, and redeeming it rewrites exactly that one record's hash. A reset
+started from one application's frontend cannot change someone's password in
+an unrelated application.
 
 **2. The link is built from the app account's own ``app_url``.** A single
-configured frontend URL — makemerich's ``PASSWORD_RESET_FRONTEND_URL`` — would
-send every application's users to whichever frontend it named. ``app_url`` is
-already registered per application and validated to http(s)
+configured frontend URL — the single-application norm — would send every
+application's users to whichever frontend it named. ``app_url`` is already
+registered per application and validated to http(s)
 (features/schemas.py::_validate_app_url), so it is both the correct value and
 one an operator can set from the account console without a redeploy.
 ``AUTH_PASSWORD_RESET_URL`` remains as a fallback for accounts that have none.
@@ -87,8 +86,8 @@ def _reset_link(app_url: str, raw_token: str) -> str:
     """Build the link mailed to the user, or "" if we have no base to use.
 
     ``app_url`` is an application's home, so the reset path is appended —
-    unless the value already points at the reset screen, which is the shape
-    ``AUTH_PASSWORD_RESET_URL`` inherits from makemerich's equivalent setting.
+    unless the value already points at the reset screen, the second of the
+    two shapes .env.example documents for ``AUTH_PASSWORD_RESET_URL``.
 
     Split into components rather than concatenated. Treating the URL as a
     string got this wrong for a base carrying a query

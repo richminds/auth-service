@@ -1,7 +1,6 @@
 """Outbound email — currently only password-reset messages.
 
-Ported from makemerich-backend's ``app/services/email_service.py``, which is
-the implementation this service is replacing. Same two-mode behaviour:
+Two modes, chosen by configuration alone:
 
 * SMTP configured  → send for real over STARTTLS or implicit SSL.
 * SMTP unconfigured → log the message body at WARNING and report ``False``.
@@ -89,9 +88,9 @@ def send_password_reset_email(
     """The reset message itself.
 
     ``app_name`` is the app account's display name rather than a hardcoded
-    product: one auth-service backs several applications, and a message that
-    said "MakeMeRich" to someone resetting their Knowledge Ingest password
-    would look like a phishing attempt.
+    product: one auth-service backs several applications, and a message
+    naming one of them to someone resetting their password for another would
+    look like a phishing attempt.
     """
     subject = f"Reset your {app_name} password"
     text_body = (

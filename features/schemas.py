@@ -103,8 +103,9 @@ class UserPublic(BaseModel):
     switch, and GET /auth/me — because with the flat fields removed this is
     the only account information in the response."""
     is_admin: bool = False
-    """True when this session is scoped to the configured admin app account —
-    the only gate on the account-administration endpoints."""
+    """True when this session is scoped to an admin-type app account
+    (features/app_accounts.py::is_admin_account) — the only gate on the
+    account-administration endpoints."""
     created_at: datetime | None = None
 
     @classmethod
@@ -113,11 +114,18 @@ class UserPublic(BaseModel):
         r: UserRecord,
         accounts: list["LoginAccount"] | None = None,
         scoped_account_id: str | None = None,
+        is_admin: bool = False,
     ) -> "UserPublic":
         """Build the response for ``r``.
 
+        ``is_admin`` is supplied by the caller rather than derived here:
+        whether the scoped account is admin-type is a fact about that
+        account's record (features/app_accounts.py::is_admin_account), and
+        this model deliberately does not reach for a repository — the same
+        reason ``accounts`` is passed in.
+
         ``scoped_account_id`` is the account THIS session is scoped to; it
-        decides both ``is_admin`` and which entry is marked ``selected``. It
+        decides which entry is marked ``selected``. It
         defaults to the record's own ``account_id``, which is now the natural
         answer: a record belongs to exactly one account, so the document the
         caller authenticated as IS the scope. It stays a parameter because
@@ -132,8 +140,6 @@ class UserPublic(BaseModel):
         Marking happens here rather than in each caller so every path that
         returns a user — login, register, switch, /auth/me — agrees on it.
         """
-        from .config import auth_settings
-
         scoped = scoped_account_id or r.account_id
         marked = [
             a.model_copy(update={"selected": bool(scoped) and a.account_id == scoped})
@@ -144,7 +150,7 @@ class UserPublic(BaseModel):
             email=r.email,
             name=r.name,
             accounts=marked,
-            is_admin=bool(scoped) and scoped == auth_settings.admin_account_id,
+            is_admin=is_admin,
             created_at=r.created_at,
         )
 
@@ -248,6 +254,11 @@ class AppType(StrEnum):
     whatever the UI's dropdown happens to offer. Adding a member here is all
     that's needed to offer a new choice — the console reads these from the API
     schema rather than keeping its own copy.
+
+    ``ADMIN`` is special: it is what makes an account's members administrators
+    (features/app_accounts.py::is_admin_account). Records carry it, but the
+    request schemas below refuse it — the one admin account is created by the
+    operator bootstrap, never through the API.
     """
 
     WEB = "web"
@@ -270,9 +281,10 @@ class AppAccountRecord(BaseModel):
     account at login. Operators now read the UUID off this record (the admin
     console shows it) and put it in the application's config.
 
-    See features/account_ids.py for how the value is produced — derived for
-    accounts that predate this change so every environment agrees, random for
-    ones registered afterwards."""
+    Minted (features/account_ids.py) — for every account, the admin one
+    included. Nothing needs to predict an ID: what makes an account the admin
+    one is its ``app_type``, so even that is read off the record after the
+    fact."""
     name: str
     description: str = ""
     app_type: AppType = AppType.OTHER
@@ -298,6 +310,24 @@ def _validate_app_url(value: str) -> str:
     return url
 
 
+def _reject_admin_type(value: AppType | None) -> AppType | None:
+    """``admin`` is not assignable through the API.
+
+    An admin-type account is what makes its members administrators
+    (features/app_accounts.py::is_admin_account), so accepting it here would
+    let any administrator — or a slip in the console's dropdown — mint another
+    admin account, or promote an existing application's entire user base by
+    flipping its type. The one admin account is created by the operator
+    bootstrap (app_accounts.ensure_admin_account) and only there.
+    """
+    if value == AppType.ADMIN:
+        raise ValueError(
+            "app_type 'admin' is reserved: the administrator account is created by the "
+            "operator bootstrap, not through this API"
+        )
+    return value
+
+
 class CreateAppAccountRequest(BaseModel):
     """Register an application. The ID is generated, so it isn't an input —
     the response carries the UUID to put in that application's config."""
@@ -308,6 +338,7 @@ class CreateAppAccountRequest(BaseModel):
     app_url: str = Field(default="", max_length=500)
 
     _check_url = field_validator("app_url")(_validate_app_url)
+    _check_type = field_validator("app_type")(_reject_admin_type)
 
 
 class UpdateAppAccountRequest(BaseModel):
@@ -325,6 +356,8 @@ class UpdateAppAccountRequest(BaseModel):
     @classmethod
     def _check_url(cls, v: str | None) -> str | None:
         return None if v is None else _validate_app_url(v)
+
+    _check_type = field_validator("app_type")(_reject_admin_type)
 
 
 
@@ -362,7 +395,7 @@ class PasswordResetTokenRecord(BaseModel):
 class ForgotPasswordRequest(BaseModel):
     """Start a reset.
 
-    ``account_id`` is required, unlike makemerich's port of this flow, because
+    ``account_id`` is required, unlike a single-application reset flow, because
     one email may back several records with independent passwords. Without it
     the service would have to guess which application's password the caller
     means, and guessing wrong silently changes the password for an unrelated

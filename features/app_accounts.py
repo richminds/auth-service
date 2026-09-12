@@ -20,17 +20,26 @@ assert_login_allowed here and features/service.py::login). This service is
 the source of truth for identity — it authenticates against its own user
 store and never reaches into an application's private database.
 
+**The admin account is the one whose ``app_type`` is ``ADMIN``.** That is the
+whole definition of administrator in this service (is_admin_account below):
+a user is an admin when the account their record belongs to carries that
+type. Nothing is configured — no ID to compare against, nothing to keep in
+step between environments — and so ``admin`` is the one type the API refuses
+to assign (features/schemas.py): an existing administrator must not be able
+to mint further admin accounts, or promote an application's entire user base,
+by picking a value from a dropdown.
+
 NO account is created at startup. ``ensure_admin_account`` still exists, but
-it is called by scripts/seed_admin.py and scripts/reset_accounts.py — an
-operator running a command — never by the service coming up. Everything else,
-the guest account included, is registered through create_app_account.
+it is an operator's command — run once, against a fresh deployment — never
+something the service does coming up. Everything else, the guest account
+included, is registered through create_app_account.
 """
 from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
 
-from .account_ids import ADMIN_ACCOUNT_SLUG, new_account_uuid
+from .account_ids import new_account_uuid
 from .repository import get_app_account_repository
 from .schemas import AppAccountRecord, AppType
 
@@ -52,6 +61,41 @@ class AdminAccountClosedError(Exception):
 
 class AppAccountDisabledError(Exception):
     """Raised when logging in for an app account that has been disabled (403)."""
+
+
+class AdminAccountTypeFixedError(Exception):
+    """Raised on an attempt to change an admin-type account's ``app_type``
+    (403). The type is what confers administrator on its members, so changing
+    it would demote every administrator at once — the caller included — with
+    nobody left able to undo it."""
+
+
+async def is_admin_account(account_id: str | None) -> bool:
+    """Whether ``account_id`` names an admin-type app account.
+
+    THE definition of administrator in this service: a user is an admin when
+    the account their record belongs to has ``app_type == AppType.ADMIN``. It
+    is a property of the account record, not a configured ID — the service
+    never has to be told which account is the admin one. Every other
+    derivation (the token's ``role`` claim, ``UserPublic.is_admin``,
+    ``require_admin``) traces back here.
+
+    An unknown or missing account is simply not an admin account.
+    """
+    if not account_id:
+        return False
+    account = await get_app_account_repository().get(account_id)
+    return account is not None and account.app_type == AppType.ADMIN
+
+
+async def admin_account_ids() -> set[str]:
+    """Every admin-type account's ID, for callers classifying many records at
+    once (the console's user list) without a lookup per row."""
+    return {
+        a.account_id
+        for a in await get_app_account_repository().list_all()
+        if a.app_type == AppType.ADMIN
+    }
 
 
 async def assert_login_allowed(account_id: str) -> None:
@@ -76,89 +120,65 @@ async def assert_login_allowed(account_id: str) -> None:
         raise AppAccountDisabledError(f"Application {account_id!r} is disabled")
 
 
-async def _ensure_account(
-    account_id: str, slug: str, name: str, description: str, app_type: AppType
-) -> AppAccountRecord:
-    # `slug` is used only for the log line and to document where the derived
-    # ID came from — it is NOT stored. An account is its UUID and its name;
-    # keeping the old slug on the record invited it being treated as a second
-    # identifier, which is exactly what moving to UUIDs was meant to end.
-    """Idempotently ensure one well-known app account exists.
-
-    The admin account's ID is DERIVED rather than minted
-    (features/account_ids.py), which is what makes bootstrapping it possible at
-    all: ``AUTH_ADMIN_ACCOUNT_ID`` has to name the account before it exists, and
-    a randomly minted ID would leave a fresh deployment with an admin gate
-    pointing at nothing.
-
-    Kept as a helper taking the ID and slug, rather than folded into
-    ensure_admin_account, because it is the only place that gets the
-    create-race handling right and a second bootstrapped account would need
-    exactly the same treatment.
-    """
-    repo = get_app_account_repository()
-    existing = await repo.get(account_id)
-    if existing is not None:
-        return existing
-
-    account = AppAccountRecord(
-        account_id=account_id,
-        name=name,
-        description=description,
-        app_type=app_type,
-        created_by="system:bootstrap",
-        created_at=datetime.now(UTC),
-    )
-    try:
-        await repo.create(account)
-    except Exception:  # noqa: BLE001 — lost a create race; the winner is fine
-        winner = await repo.get(account_id)
-        if winner is not None:
-            return winner
-        raise
-    logger.info("Auth: bootstrapped the %s app account (account_id=%s)", slug, account_id)
-    return account
+ADMIN_ACCOUNT_NAME = "RichMinds"
+"""Display name of the bootstrapped admin account — the platform's own admin
+console. A label, not an identifier: nothing looks an account up by name."""
 
 
 async def ensure_admin_account() -> AppAccountRecord:
     """Idempotently create the admin app account. **Operator-invoked only.**
 
-    Holding a record in this account is the only thing that grants
-    administrative access (features/dependencies.py::require_admin), so it has
-    to exist before anyone can be tied to it — and it cannot be created through
-    POST /auth/accounts, because that route requires the administrator this
-    account is a prerequisite for.
+    Holding a record in an admin-type account is the only thing that grants
+    administrative access (is_admin_account), so one has to exist before
+    anyone can be tied to it — and it cannot be created through
+    POST /auth/accounts: that route requires the administrator this account
+    is a prerequisite for, and it refuses ``app_type=admin`` outright
+    (features/schemas.py) so an existing administrator cannot mint more admin
+    accounts by accident.
 
-    This function is how that cycle is broken, and the service no longer calls
-    it at startup: scripts/seed_admin.py does, when an operator runs it. That
-    is the difference between an account existing because someone asked for it
-    and one existing because a process restarted.
+    This function is how that cycle is broken, and the service never calls it
+    at startup: an operator does, once, on a fresh deployment (the README
+    shows how). That is the difference between an account existing because
+    someone asked for it and one existing because a process restarted.
 
-    Its ID is derived rather than minted (features/account_ids.py) so
-    ``AUTH_ADMIN_ACCOUNT_ID`` can name it before it exists — every environment
-    and every client agrees on the value without copying it around.
+    Its ID is MINTED, like every other account's. Nothing here needs to know
+    it in advance — the gate is the account's type, not its ID — so the value
+    is read off the returned record and put in the admin console's
+    configuration (VITE_ADMIN_ACCOUNT_ID), exactly as any other application
+    learns its own ID. Idempotent on "an admin-type account already exists":
+    a repeat run returns that account rather than minting a second one. Two
+    runs racing each other could each mint one, so run it once, from one
+    place — it is an operator's step, not a startup hook.
     """
-    from .config import auth_settings
+    repo = get_app_account_repository()
+    existing = [a for a in await repo.list_all() if a.app_type == AppType.ADMIN]
+    if existing:
+        return min(existing, key=lambda a: a.created_at)
 
-    return await _ensure_account(
-        auth_settings.admin_account_id,
-        ADMIN_ACCOUNT_SLUG,
-        "RichMinds",
-        "Maintains all the app accounts.",
-        AppType.ADMIN,
+    account = AppAccountRecord(
+        account_id=new_account_uuid(),
+        name=ADMIN_ACCOUNT_NAME,
+        description="Maintains all the app accounts.",
+        app_type=AppType.ADMIN,
+        created_by="system:bootstrap",
+        created_at=datetime.now(UTC),
     )
+    await repo.create(account)
+    logger.info(
+        "Auth: bootstrapped the admin app account (account_id=%s) — this is the value "
+        "for the admin console's VITE_ADMIN_ACCOUNT_ID",
+        account.account_id,
+    )
+    return account
 
 
 # There is no ensure_guest_account. The knowledge-ingest console's public
-# "Create User" button used to rely on one being bootstrapped; it now has to
-# name an account somebody registered.
-#
-# CONSEQUENCE, deliberately left visible rather than papered over: a public
-# sign-up posting a hardcoded guest account_id gets 404 AppAccountNotFoundError
-# wherever no such account was registered (service.register validates the ID).
-# Register one through POST /auth/accounts and set the console's
-# VITE_GUEST_ACCOUNT_ID to the UUID it mints — minted, so it differs per
-# environment and cannot be hardcoded the way the derived one was.
+# "Create User" button names an account somebody registered through
+# POST /auth/accounts, configured into that console as VITE_GUEST_ACCOUNT_ID —
+# minted, like every account's ID, so it differs per environment. With no such
+# account registered the button's sign-ups 404 (service.register validates
+# the ID), which is the visible, correct outcome rather than something to
+# paper over with a bootstrap.
 
 
 async def create_app_account(
@@ -226,6 +246,16 @@ async def update_app_account(
     if description is not None:
         changes["description"] = description.strip()
     if app_type is not None:
+        # The admin account's type is what makes its members administrators,
+        # so changing it would demote every one of them at once — the caller
+        # included — with no administrator left to undo it. Refused here and
+        # not only at the schema, so a caller that is not the HTTP layer gets
+        # the same answer.
+        current = await get_app_account(account_id)
+        if current.app_type == AppType.ADMIN and app_type != AppType.ADMIN:
+            raise AdminAccountTypeFixedError(
+                f"App account {account_id!r} is the administrator account; its type is fixed"
+            )
         # Kept as the enum so the in-memory repo's model_copy() (which doesn't
         # validate) stores a correctly-typed value; the Mongo repo encodes it
         # on the way out, the same as it does datetimes.

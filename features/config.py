@@ -1,4 +1,4 @@
-"""Auth domain configuration — JWT, password hashing, storage, admin account.
+"""Auth domain configuration — JWT, password hashing, storage.
 
 Env vars (no blanket prefix — names match the source implementation in the
 calling application's ``backend/shared/auth`` + ``backend/services/auth``
@@ -9,11 +9,15 @@ verbatim, so an existing ``.env`` value copies straight across):
     AUTH_ACCESS_TTL_MINUTES   — access-token lifetime in minutes, default 60
     AUTH_MONGO_URI            — falls back to bare MONGO_URI when unset
     AUTH_MONGO_DB_NAME        — falls back to bare MONGO_DB_NAME, default "app"
-    AUTH_ADMIN_ACCOUNT_ID     — the admin app account's UUID; defaults to the
-                                value derived from the "richminds" slug
+
+There is deliberately no admin-account setting. Administrator-ness is a
+property of the app account a user's record belongs to
+(``AppAccountRecord.app_type == AppType.ADMIN``, features/app_accounts.py),
+so the service never has to be told which account that is — the admin console
+is the only thing that names it, in its own configuration.
 
 This module — and only this module — owns *what* the service authenticates
-against (secret, token lifetime, storage, admin account). ``app/config.py``
+against (secret, token lifetime, storage). ``app/config.py``
 owns *how the service is exposed* (host/port/CORS/docs), matching the split
 already used by the sibling llm-gateway (``features/config.py`` vs
 ``app/config.py``) and knowledge-service (``rag/config.py`` vs ``app/config.py``).
@@ -24,8 +28,6 @@ from pathlib import Path
 
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-from .account_ids import ADMIN_ACCOUNT_UUID
 
 _ROOT = Path(__file__).parent.parent
 
@@ -94,35 +96,17 @@ class AuthSettings(BaseSettings):
     app_accounts_collection: str = "app_accounts"
 
     # ------------------------------------------------------------ password hash
-    # bcrypt cost factor for new passwords. 12 is the current default and
-    # matches what makemerich-backend writes, so imported hashes don't all
-    # look stale. Raising it re-hashes each user on their next successful
-    # login (features/security.py::needs_rehash) rather than at once.
+    # bcrypt cost factor for new passwords. 12 is the bcrypt library's own
+    # default (gensalt), so it is what an application storing bcrypt most
+    # likely writes and imported hashes don't all look stale. Raising it
+    # re-hashes each user on their next successful login
+    # (features/security.py::needs_rehash) rather than at once.
     bcrypt_rounds: int = Field(default=12, validation_alias="AUTH_BCRYPT_ROUNDS")
 
-    # ------------------------------------------------------------------- admin
-    # Administering this service (app accounts) is gated on membership of ONE
-    # app account — the RichMinds admin application. A user record whose
-    # UserRecord.account_id EQUALS this value is an admin; nobody else is.
-    # Since records are per-account, that is a property of the single document
-    # the caller signed in as, not a search through a membership list.
-    #
-    # Account IDs are UUIDs, so this default cannot be a readable slug any
-    # more. It is DERIVED from the old "richminds" slug rather than random
-    # (features/account_ids.py) precisely so a default is possible: the admin
-    # account is created at startup, and a randomly minted ID would leave a
-    # fresh deployment with no administrator until someone read the value out
-    # of Mongo. Derivation also makes a migrated database and a freshly
-    # bootstrapped one agree on the value.
-    admin_account_id: str = Field(
-        default=ADMIN_ACCOUNT_UUID, validation_alias="AUTH_ADMIN_ACCOUNT_ID"
-    )
-
     # ---------------------------------------------------------- password reset
-    # Ported from makemerich-backend, which is the implementation this service
-    # replaces. Names are prefixed AUTH_ to match the rest of this file rather
-    # than copied verbatim, because SMTP_* would collide with any other
-    # service sharing an environment.
+    # Names are prefixed AUTH_ to match the rest of this file rather than the
+    # conventional bare SMTP_* / PASSWORD_RESET_*, because those would collide
+    # with any other service sharing an environment.
     password_reset_tokens_collection: str = "password_reset_tokens"
     password_reset_ttl_minutes: int = Field(
         default=30, validation_alias="AUTH_PASSWORD_RESET_TTL_MINUTES"

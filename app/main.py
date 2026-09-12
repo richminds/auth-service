@@ -99,12 +99,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # account to exist, and creating an account through POST /auth/accounts
     # needs an administrator. A fresh deployment therefore CANNOT bootstrap
     # itself through the API, by design. Break the cycle out of band, once:
-    #
-    #     python scripts/seed_admin.py
-    #
-    # which creates the admin account and its first administrator together,
-    # through the same repository the service uses. Everything after that is
-    # ordinary API work.
+    # an operator calls features.app_accounts.ensure_admin_account() against
+    # the deployment's database (the README shows the snippet). It mints the
+    # admin account and returns its ID, which goes into the admin console's
+    # VITE_ADMIN_ACCOUNT_ID; the first administrator then self-registers into
+    # it. Everything after that is ordinary API work.
 
     logger.info(
         "Auth Service ready — mongo=%s db=%s",

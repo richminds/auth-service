@@ -6,8 +6,8 @@
 **Two hash schemes are readable, one is written.** ``verify_password``
 dispatches on the stored hash's own prefix, so this service accepts:
 
-    $2b$12$...              bcrypt — what it writes now, and the format
-                            makemerich-backend already stores. Importing that
+    $2b$12$...              bcrypt — what it writes now, and what most
+                            applications already store. Importing such an
                             application's users is a straight copy of the
                             existing hash: nobody resets a password.
     pbkdf2_sha256$r$s$h     the scheme this service used originally.
@@ -44,18 +44,18 @@ logger = logging.getLogger(__name__)
 # with regardless of this value.
 _PBKDF2_ALGO = "sha256"
 
-# bcrypt rejects (rather than truncates) anything past 72 bytes, and
-# makemerich-backend trims to the same boundary before hashing — so an
-# imported hash of a long password only verifies if we trim identically.
+# bcrypt rejects (rather than truncates) anything past 72 bytes, so any
+# application storing bcrypt trims before hashing — and an imported hash of
+# a long password only verifies if we trim to the same boundary it did.
 _BCRYPT_MAX_BYTES = 72
 
 
 def _truncate_password(password: str) -> bytes:
     """Trim to bcrypt's 72-byte limit without splitting a multi-byte char.
 
-    Mirrors makemerich-backend's app/auth/service.py::_truncate_password
-    exactly; a different trim would silently fail to verify imported hashes
-    of passwords longer than 72 bytes.
+    Part of the import contract: an application whose bcrypt hashes are
+    copied in must have trimmed the same way, or its hashes of passwords
+    longer than 72 bytes silently fail to verify here.
     """
     raw = password.encode("utf-8")
     if len(raw) <= _BCRYPT_MAX_BYTES:

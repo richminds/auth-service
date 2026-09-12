@@ -28,6 +28,7 @@ from uuid import uuid4
 from .blacklist import is_token_revoked, revoke_token
 from .repository import DuplicateUserError, get_repository
 from .schemas import (
+    AppType,
     LoginAccount,
     LoginRequest,
     RegisterRequest,
@@ -88,27 +89,21 @@ def _new_user_id() -> str:
     return f"USR-{uuid4().hex[:12].upper()}"
 
 
-def _role_for(account_id: str | None) -> str:
-    """"admin" for a session scoped to the admin app account, else "user".
+async def _role_for(account_id: str | None) -> str:
+    """"admin" for a session scoped to an admin-type app account, else "user".
 
-    The single derivation of administrator-ness in this service, shared with
-    ``UserPublic.from_record``. Membership of the configured admin app account
-    is the whole rule — there is no separate staff allowlist.
+    The single derivation of administrator-ness in this service; ``_token_for``
+    feeds the same answer to ``UserPublic.is_admin``. Whether the scoped
+    account is admin-type is a fact about that account's record
+    (features/app_accounts.py::is_admin_account) — there is no configured
+    admin ID and no separate staff allowlist.
     """
-    # Imported here rather than at module scope, matching the other settings
-    # reads in this module: the settings singleton is built at import time, and
-    # a module-level import would pin it before the test suite's environment is
-    # in place.
-    from .config import auth_settings
+    from .app_accounts import is_admin_account
 
-    return (
-        "admin"
-        if account_id and account_id == auth_settings.admin_account_id
-        else "user"
-    )
+    return "admin" if await is_admin_account(account_id) else "user"
 
 
-def _token_for(
+async def _token_for(
     user: UserRecord,
     account_id: str | None = None,
     accounts: list[LoginAccount] | None = None,
@@ -117,27 +112,27 @@ def _token_for(
     # application, so the document the caller authenticated as is the scope.
     # Callers that resolved a sibling record pass the account explicitly.
     scoped_account_id = account_id or user.account_id
+    role = await _role_for(scoped_account_id)
     token = create_access_token(
         subject=user.user_id,
         extra_claims={
             "email": user.email,
             "name": user.name,
             # The application this token is scoped to, and the only scope there
-            # is: require_admin reads it, and downstream services filter their
-            # data on it, so it travels in the token rather than being
+            # is: downstream services filter their data on it, and "role" below
+            # is derived from it, so it travels in the token rather than being
             # re-fetched on every request.
             "account_id": scoped_account_id,
             # Derived from the SCOPED account, exactly as UserPublic.is_admin
             # is (features/schemas.py) — a user who administers one application
             # is not an administrator of a session scoped to another.
             #
-            # This service does not read the claim; it is minted for the
-            # services that do. llm-gateway and knowledge-service authorize
-            # their admin routes on a token's "role", and with no such claim
-            # every caller resolved to "user" and those routes were
-            # unreachable for everyone. Named "role" rather than "is_admin"
-            # because that is the key those services already look for.
-            "role": _role_for(scoped_account_id),
+            # Read by this service's own require_admin AND by the services
+            # downstream: llm-gateway and knowledge-service authorize their
+            # admin routes on a token's "role", so all three agree on who is an
+            # administrator for the life of a token. Named "role" rather than
+            # "is_admin" because that is the key those services look for.
+            "role": role,
         },
     )
     # The scoped account is a property of this token, not of the user record,
@@ -146,7 +141,10 @@ def _token_for(
     return TokenResponse(
         access_token=token,
         user=UserPublic.from_record(
-            user, accounts=accounts, scoped_account_id=scoped_account_id
+            user,
+            accounts=accounts,
+            scoped_account_id=scoped_account_id,
+            is_admin=role == "admin",
         ),
     )
 
@@ -231,10 +229,10 @@ async def register(req: RegisterRequest) -> TokenResponse:
     # confusion later.
     if req.account_id:
         from .app_accounts import AdminAccountClosedError, AppAccountNotFoundError
-        from .config import auth_settings
         from .repository import get_app_account_repository
 
-        if await get_app_account_repository().get(req.account_id) is None:
+        account = await get_app_account_repository().get(req.account_id)
+        if account is None:
             raise AppAccountNotFoundError(f"App account {req.account_id!r} not found")
 
         # Registration is public, so joining the admin account cannot be. Allow
@@ -243,12 +241,14 @@ async def register(req: RegisterRequest) -> TokenResponse:
         # further admins have to be made deliberately. Without this, anyone who
         # knows the admin account_id could sign up as an administrator.
         #
-        # "Is there an admin already" is now simply "does a record exist in the
+        # "Is there an admin already" is simply "does a record exist in the
         # admin account" — one property of one document, where it used to mean
-        # scanning every user's membership array.
-        if req.account_id == auth_settings.admin_account_id:
+        # scanning every user's membership array. And WHICH account is the
+        # admin one is the record's own type (app_accounts.is_admin_account),
+        # so the rule needs no configured ID to compare against.
+        if account.app_type == AppType.ADMIN:
             existing_admins = [
-                u for u in await repo.list_all() if u.account_id == auth_settings.admin_account_id
+                u for u in await repo.list_all() if u.account_id == req.account_id
             ]
             if existing_admins:
                 raise AdminAccountClosedError(
@@ -281,7 +281,9 @@ async def register(req: RegisterRequest) -> TokenResponse:
     )
     # The person's OTHER accounts are included: registering a second account
     # for an existing email should show them both, the same as a login would.
-    return _token_for(user, accounts=await _login_accounts(await accounts_for_email(email)))
+    return await _token_for(
+        user, accounts=await _login_accounts(await accounts_for_email(email))
+    )
 
 
 async def login(req: LoginRequest) -> TokenResponse:
@@ -352,7 +354,7 @@ async def login(req: LoginRequest) -> TokenResponse:
     # the password again. The token is scoped to the record that actually
     # authenticated — by construction one whose password this caller proved.
     accounts = await _login_accounts(await accounts_for_email(email))
-    return _token_for(user, accounts=accounts)
+    return await _token_for(user, accounts=accounts)
 
 
 async def select_account(user_id: str, account_id: str) -> TokenResponse:
@@ -391,7 +393,7 @@ async def select_account(user_id: str, account_id: str) -> TokenResponse:
         "Auth: %s switched to account %s as %s", user_id, account_id, target.user_id
     )
     accounts = await _login_accounts(await accounts_for_email(current.email))
-    return _token_for(target, accounts=accounts)
+    return await _token_for(target, accounts=accounts)
 
 
 async def logout(token: str, user_id: str) -> None:
@@ -496,7 +498,7 @@ async def refresh_token(token: str) -> TokenResponse:
     # moves the session to a different application — the user picked that with
     # POST /auth/me/account and refreshing is not a place to change it.
     accounts = await _login_accounts(await accounts_for_email(user.email))
-    return _token_for(user, account_id=claims.get("account_id"), accounts=accounts)
+    return await _token_for(user, account_id=claims.get("account_id"), accounts=accounts)
 
 
 async def get_user(user_id: str, scoped_account_id: str | None = None) -> UserPublic | None:
@@ -513,13 +515,17 @@ async def get_user(user_id: str, scoped_account_id: str | None = None) -> UserPu
     naming an account the record has since been moved out of, must not silently
     report a different scope than the token actually carries.
     """
+    from .app_accounts import is_admin_account
+
     user = await get_repository().get_by_id(user_id)
     if user is None:
         return None
+    scoped = scoped_account_id or user.account_id
     return UserPublic.from_record(
         user,
         accounts=await _login_accounts(await accounts_for_email(user.email)),
-        scoped_account_id=scoped_account_id,
+        scoped_account_id=scoped,
+        is_admin=await is_admin_account(scoped),
     )
 
 
@@ -540,10 +546,14 @@ async def list_users() -> list[UserPublic]:
     the relationship between the rows is visible; ``selected`` marks the row's
     own account.
     """
+    from .app_accounts import admin_account_ids
+
     users = await get_repository().list_all()
     # One membership query per distinct email rather than per record: a console
     # listing every user would otherwise re-run the same query for each of a
-    # person's records.
+    # person's records. Likewise one query for the admin-type accounts rather
+    # than a lookup per row.
+    admin_ids = await admin_account_ids()
     by_email: dict[str, list[LoginAccount]] = {}
     out: list[UserPublic] = []
     for u in users:
@@ -551,7 +561,12 @@ async def list_users() -> list[UserPublic]:
         if key not in by_email:
             by_email[key] = await _login_accounts(await accounts_for_email(u.email))
         out.append(
-            UserPublic.from_record(u, accounts=by_email[key], scoped_account_id=u.account_id)
+            UserPublic.from_record(
+                u,
+                accounts=by_email[key],
+                scoped_account_id=u.account_id,
+                is_admin=u.account_id in admin_ids,
+            )
         )
     return out
 

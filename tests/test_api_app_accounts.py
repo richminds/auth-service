@@ -7,12 +7,15 @@ read its ID back rather than naming one up front.
 """
 from __future__ import annotations
 
+from uuid import UUID, uuid4
+
 from .conftest import (
-    ADMIN_ACCOUNT_ID,
+    admin_account_id,
     admin_token,
     auth_headers,
     create_account,
     register,
+    seed_admin_account,
     selected_account,
 )
 
@@ -44,30 +47,32 @@ def test_registering_an_app_account_requires_admin(client):
 def test_admin_is_conferred_by_app_account_membership(client):
     token = admin_token(client, "first-admin@richminds.io")
     me = client.get("/auth/me", headers=auth_headers(token)).json()
-    assert selected_account(me) == ADMIN_ACCOUNT_ID
+    assert selected_account(me) == admin_account_id()
     assert me["is_admin"] is True
     assert client.get("/auth/accounts", headers=auth_headers(token)).status_code == 200
 
 
-def test_admin_account_id_is_stable_across_deployments(client):
-    """The admin account's ID is derived, not random.
+def test_the_admin_account_id_is_minted_and_seeding_is_idempotent(client):
+    """The admin account's ID is minted like any other; the operator step
+    returns it, and running the step again returns the SAME account.
 
-    ``AUTH_ADMIN_ACCOUNT_ID`` is the only gate on administrative access and the
-    account it names is created at startup. A randomly minted ID would leave a
-    fresh deployment with no reachable administrator and no correct default,
-    so the value has to be predictable from the "richminds" slug — and the same
-    one the backfill script computes for an existing database.
+    Nothing has to know the ID in advance: administrator-ness is the account's
+    TYPE, not a match against a configured value, so a fresh deployment mints
+    one and the operator copies it into the admin console's config. A second
+    run must not mint a second admin account.
     """
-    from features.account_ids import account_uuid_for
+    first = seed_admin_account()
+    UUID(first)  # a real UUID, not a slug
+    assert seed_admin_account() == first
 
-    assert ADMIN_ACCOUNT_ID == account_uuid_for("richminds")
-
-    token = _staff(client)
+    token = _staff(client)  # seeds again on its way — still the same account
     listed = client.get("/auth/accounts", headers=auth_headers(token)).json()
-    admin = next(a for a in listed if a["account_id"] == ADMIN_ACCOUNT_ID)
+    admin = next(a for a in listed if a["account_id"] == first)
     assert admin["name"] == "RichMinds"
-    # The slug is NOT stored: an account is its UUID and its name. Keeping the
-    # old slug on the record invited treating it as a second identifier.
+    assert admin["app_type"] == "admin"
+    assert [a["account_id"] for a in listed if a["app_type"] == "admin"] == [first]
+    # No slug is stored: an account is its UUID and its name. Keeping a slug
+    # on the record invited treating it as a second identifier.
     assert "legacy_account_id" not in admin
 
 
@@ -77,9 +82,9 @@ def test_starting_the_service_creates_no_accounts(client):
     A bootstrap runs on every cold start, so it recreates whatever an operator
     deleted; a guest account removed on purpose came back the moment the
     database was reachable again. Nothing is seeded now, and this asserts the
-    absence directly: registering into the admin account fails because the
-    account is not there, which is also the chicken-and-egg that
-    scripts/seed_admin.py exists to break.
+    absence directly: registering into ANY account fails because none is
+    there — the admin one included, which is the chicken-and-egg the
+    operator's ensure_admin_account() step exists to break.
     """
     r = client.post(
         "/auth/register",
@@ -87,7 +92,7 @@ def test_starting_the_service_creates_no_accounts(client):
             "email": "first@example.com",
             "name": "First",
             "password": "hunter22",
-            "account_id": ADMIN_ACCOUNT_ID,
+            "account_id": str(uuid4()),
         },
     )
     assert r.status_code == 404, r.text
@@ -107,22 +112,21 @@ def test_seeding_the_admin_account_breaks_the_cycle(client):
 def test_a_public_signup_into_an_unregistered_account_is_refused(client):
     """The cost of not bootstrapping the guest account, stated as a test.
 
-    The knowledge console's "Create User" button posts a hardcoded account_id
-    from a form with no session. While that account is unregistered the call
-    404s — service.register validates the ID — so the button is broken until a
-    guest account is registered through POST /auth/accounts and the console is
-    configured with the ID it is given.
+    The knowledge console's "Create User" button posts the account_id it is
+    configured with (VITE_GUEST_ACCOUNT_ID) from a form with no session. While
+    that account is unregistered the call 404s — service.register validates
+    the ID — so the button is broken until a guest account is registered
+    through POST /auth/accounts and the console is configured with the ID it
+    is given.
     """
-    from features.account_ids import account_uuid_for
-
     r = client.post(
         "/auth/register",
         json={
             "email": "newbie@example.com",
             "name": "Newbie",
             "password": "hunter22",
-            # The historical derived value the console still pins.
-            "account_id": account_uuid_for("guest"),
+            # A value that nothing registered — a stale or mistyped config.
+            "account_id": str(uuid4()),
         },
     )
     assert r.status_code == 404, r.text
@@ -168,7 +172,7 @@ def test_guest_signups_cannot_name_the_admin_account(client):
             "email": "sneaky@example.com",
             "name": "Sneaky",
             "password": "hunter22",
-            "account_id": ADMIN_ACCOUNT_ID,
+            "account_id": admin_account_id(),
         },
     )
     assert r.status_code == 403
@@ -185,7 +189,7 @@ def test_admin_account_is_closed_after_the_first_admin(client):
             "email": "opportunist@example.com",
             "name": "Opportunist",
             "password": "hunter22",
-            "account_id": ADMIN_ACCOUNT_ID,
+            "account_id": admin_account_id(),
         },
     )
     assert r.status_code == 403
@@ -326,6 +330,89 @@ def test_type_and_url_can_be_updated(client):
     assert r.json()["name"] == "Evolve"
 
 
+# ─────────────────────────────────────────────── the admin type is reserved
+#
+# app_type == "admin" IS the privilege (features/app_accounts.py::is_admin_account),
+# so it must not be assignable through the API: otherwise an administrator
+# could mint further admin accounts, or promote an existing application's
+# whole user base, from a dropdown.
+
+
+def test_the_admin_type_cannot_be_assigned_at_registration(client):
+    token = _staff(client)
+    r = client.post(
+        "/auth/accounts",
+        json={"name": "Shadow Console", "app_type": "admin"},
+        headers=auth_headers(token),
+    )
+    assert r.status_code == 422, r.text
+    assert "reserved" in r.text
+
+
+def test_an_account_cannot_be_promoted_to_the_admin_type(client):
+    """Flipping an application's type to admin would make every one of its
+    users an administrator at once."""
+    token = _staff(client)
+    app_id = create_account(client, token, "Customer Portal", app_type="web")["account_id"]
+    r = client.patch(
+        f"/auth/accounts/{app_id}",
+        json={"app_type": "admin"},
+        headers=auth_headers(token),
+    )
+    assert r.status_code == 422, r.text
+
+    # And its users are still ordinary users.
+    r = client.post(
+        "/auth/register",
+        json={
+            "email": "u@portal.example",
+            "name": "U",
+            "password": "hunter22",
+            "account_id": app_id,
+        },
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["user"]["is_admin"] is False
+    user_token = r.json()["access_token"]
+    assert client.get("/auth/accounts", headers=auth_headers(user_token)).status_code == 403
+
+
+def test_the_admin_accounts_type_cannot_be_changed(client):
+    """Changing it would demote every administrator — the caller included —
+    with nobody left to undo it."""
+    token = _staff(client)
+    r = client.patch(
+        f"/auth/accounts/{admin_account_id()}",
+        json={"app_type": "web"},
+        headers=auth_headers(token),
+    )
+    assert r.status_code == 403, r.text
+    assert r.json()["error"]["code"] == "admin_account_type_fixed"
+
+    # Other fields on it remain editable — only the type is fixed.
+    r = client.patch(
+        f"/auth/accounts/{admin_account_id()}",
+        json={"description": "Still the admin console."},
+        headers=auth_headers(token),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["app_type"] == "admin"
+
+    # And the caller is still an administrator.
+    assert client.get("/auth/accounts", headers=auth_headers(token)).status_code == 200
+
+
+def test_admin_is_a_property_of_the_account_type_not_an_id(client):
+    """Two stores, two minted admin IDs, one rule: membership of whichever
+    account carries app_type == admin. No configured value is involved."""
+    token = _staff(client)
+    listed = client.get("/auth/accounts", headers=auth_headers(token)).json()
+    assert [a["app_type"] for a in listed] == ["admin"]
+    me = client.get("/auth/me", headers=auth_headers(token)).json()
+    assert me["is_admin"] is True
+    assert selected_account(me) == listed[0]["account_id"]
+
+
 # ─────────────────────────────────────────────── get / update / delete
 
 
@@ -434,7 +521,7 @@ def test_login_rejects_a_user_from_a_different_account(client):
         json={
             "email": "member@other.example",
             "password": "hunter22",
-            "account_id": ADMIN_ACCOUNT_ID,
+            "account_id": admin_account_id(),
         },
     )
     assert r.status_code == 401
@@ -445,16 +532,17 @@ def test_a_user_with_no_accounts_cannot_claim_one(client):
 
     It used to skip entirely when the user belonged to nothing, so anyone who
     could sign up could name the ADMIN account at login and be issued a token
-    scoped to it — and since is_admin is derived from
-    ``account_id == AUTH_ADMIN_ACCOUNT_ID``, that made them an administrator.
+    scoped to it — and since is_admin is derived from the scoped account's
+    type, that made them an administrator.
     """
+    admin_id = seed_admin_account()
     register(client, "legacy-user@example.com", "Legacy")
     r = client.post(
         "/auth/login",
         json={
             "email": "legacy-user@example.com",
             "password": "hunter22",
-            "account_id": ADMIN_ACCOUNT_ID,
+            "account_id": admin_id,
         },
     )
     # Same error as a bad password: memberships aren't probeable while

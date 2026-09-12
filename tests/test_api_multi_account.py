@@ -15,12 +15,13 @@ to live in the token rather than in the client.
 from __future__ import annotations
 
 from .conftest import (
-    ADMIN_ACCOUNT_ID,
     account_ids,
+    admin_account_id,
     admin_token,
     auth_headers,
     create_account,
     register,
+    seed_admin_account,
     selected_account,
 )
 
@@ -150,7 +151,7 @@ def test_login_through_a_non_member_account_is_rejected(client):
 
     r = client.post(
         "/auth/login",
-        json={"email": email, "password": "hunter22", "account_id": ADMIN_ACCOUNT_ID},
+        json={"email": email, "password": "hunter22", "account_id": admin_account_id()},
     )
     # Same error as a bad password: memberships aren't probeable while
     # unauthenticated.
@@ -163,7 +164,7 @@ def test_selecting_a_non_member_account_is_forbidden(client):
 
     r = client.post(
         "/auth/me/account",
-        json={"account_id": ADMIN_ACCOUNT_ID},
+        json={"account_id": admin_account_id()},
         headers=auth_headers(token),
     )
     assert r.status_code == 403
@@ -175,10 +176,11 @@ def test_naming_the_admin_account_never_grants_admin(client):
     """Privilege escalation regression.
 
     The login membership check used to be skipped for a user who belonged to
-    no accounts, so any signup could name AUTH_ADMIN_ACCOUNT_ID and receive a
+    no accounts, so any signup could name the admin account and receive a
     token scoped to it. `is_admin` is derived from that scope, so the escalated
     token then passed every admin gate — in auth-service AND at the gateway.
     """
+    admin_id = seed_admin_account()
     register(client, "outsider@example.com", "Outsider")
 
     escalation = client.post(
@@ -186,7 +188,7 @@ def test_naming_the_admin_account_never_grants_admin(client):
         json={
             "email": "outsider@example.com",
             "password": "hunter22",
-            "account_id": ADMIN_ACCOUNT_ID,
+            "account_id": admin_id,
         },
     )
     assert escalation.status_code == 401

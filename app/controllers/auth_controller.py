@@ -143,8 +143,7 @@ async def me(user: AuthUser = Depends(get_current_user)) -> UserPublic:
         # Token valid but user no longer exists in this service's own store
         # (e.g. an app account whose users live elsewhere) — fall back to the
         # token's claims.
-        from features.config import auth_settings
-
+        #
         # The flat account_id is gone from the response, so the token's account
         # has to be reported the way every other path reports it: as the
         # selected entry of `accounts`. There is no record to look up a display
@@ -159,7 +158,9 @@ async def me(user: AuthUser = Depends(get_current_user)) -> UserPublic:
             email=user.email or "",
             name=user.name or "",
             accounts=accounts,
-            is_admin=bool(user.account_id) and user.account_id == auth_settings.admin_account_id,
+            # The claim was derived from the account record at sign-in; with no
+            # user record to look at, it is the only answer there is.
+            is_admin=user.role == "admin",
         )
     return found
 

@@ -16,7 +16,14 @@ import pytest
 
 from features.config import auth_settings
 
-from .conftest import ADMIN_ACCOUNT_ID, admin_token, auth_headers, create_account, register
+from .conftest import (
+    admin_account_id,
+    admin_token,
+    auth_headers,
+    create_account,
+    register,
+    seed_admin_account,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -68,7 +75,7 @@ def test_accountless_record_is_not_reachable_from_an_account(client):
     application, so naming one finds nothing — the same silent miss as an
     unknown address."""
     register(client, "reset@b.com", "R")
-    assert _forgot(client, "reset@b.com", ADMIN_ACCOUNT_ID).get("debug_token") is None
+    assert _forgot(client, "reset@b.com", seed_admin_account()).get("debug_token") is None
 
 
 def test_full_reset_cycle_for_a_record_in_an_account(client):
@@ -122,7 +129,7 @@ def test_unknown_email_gets_the_same_answer_as_a_known_one(client):
     token = admin_token(client)
     app_id = create_account(client, token, "App")["account_id"]
 
-    known = _forgot(client, "admin@richminds.io", ADMIN_ACCOUNT_ID)
+    known = _forgot(client, "admin@richminds.io", admin_account_id())
     unknown = _forgot(client, "nobody@nowhere.com", app_id)
 
     assert known["message"] == unknown["message"] == GENERIC
@@ -273,7 +280,7 @@ def test_debug_token_is_withheld_when_not_opted_in(client):
         # Trailing slashes are the operator's, not ours.
         ("https://console.example.com/", "", "https://console.example.com/reset-password?token=T"),
         # Already pointing at the reset screen — don't double the path. This is
-        # the shape AUTH_PASSWORD_RESET_URL inherits from makemerich's setting.
+        # the second of the two shapes .env.example allows AUTH_PASSWORD_RESET_URL.
         (
             "https://console.example.com/reset-password",
             "",

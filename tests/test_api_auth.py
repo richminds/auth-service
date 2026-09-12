@@ -155,11 +155,11 @@ def test_the_role_follows_the_account_the_token_is_scoped_to(client):
     exactly as UserPublic.is_admin is."""
     from features.security import decode_token
 
-    from .conftest import ADMIN_ACCOUNT_ID, admin_token
+    from .conftest import admin_account_id, admin_token
 
     token = admin_token(client)
     claims = decode_token(token)
-    assert claims["account_id"] == ADMIN_ACCOUNT_ID
+    assert claims["account_id"] == admin_account_id()
     assert claims["role"] == "admin"
 
 

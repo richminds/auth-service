@@ -229,9 +229,9 @@ login.
 That is also what makes **importing another application's users cheap**: copy
 their existing bcrypt hash into this service's `users` collection and they
 sign in with the password they already have. Long passwords are trimmed to
-bcrypt's 72-byte limit on a UTF-8 boundary, matching how makemerich-backend
-trims before hashing, so even >72-byte passwords verify against imported
-hashes.
+bcrypt's 72-byte limit on a UTF-8 boundary; an imported hash of a >72-byte
+password verifies as long as the source application trimmed the same way
+before hashing.
 
 ## Token lifecycle and revocation
 
@@ -309,11 +309,18 @@ refresh before this service ever saw it.
 
 ## Administration
 
-There is one privilege: **membership of the admin app account**
-(`AUTH_ADMIN_ACCOUNT_ID`, default `328dc8a2-c30c-5715-920f-21b963b5ce39` —
-the UUID derived from the original `richminds` slug, see
-`features/account_ids.py`). A user whose `account_id` equals it is an admin — that is the whole rule, and it gates every
-`/auth/accounts` endpoint via `require_admin`.
+There is one privilege: **membership of an admin-type app account** — one
+whose `app_type` is `admin` (`features/app_accounts.py::is_admin_account`). A
+user whose record belongs to such an account is an admin — that is the whole
+rule, and it gates every `/auth/accounts` endpoint via `require_admin`. It is
+a property of the account record, not a configured ID: nothing in this
+service names the admin account, and the value lives only in the admin
+console's own configuration (`VITE_ADMIN_ACCOUNT_ID` in account-management-ui).
+
+Because the type *is* the privilege, `admin` is the one `app_type` the API
+refuses: `POST`/`PATCH /auth/accounts` answer 422 to it, and changing the
+admin account's type answers 403 — otherwise an administrator could mint more
+admin accounts, or promote an application's entire user base, from a dropdown.
 
 **Nothing is created at startup.** Starting the service brings no app account
 into existence — not this one. A bootstrap runs on every cold start, so it
@@ -324,24 +331,35 @@ nobody asked for, attributed to `system:bootstrap`.
 That leaves a deliberate chicken-and-egg: registering the first administrator
 needs this account to exist, and `POST /auth/accounts` needs an administrator.
 A fresh deployment cannot bootstrap itself through the API. Break the cycle
-once, out of band:
+once, out of band, against the deployment's database:
 
 ```bash
-python scripts/seed_admin.py            # RichMinds account + its first admin
-python scripts/seed_admin.py --dry-run  # report first
+python - <<'EOF'
+import asyncio
+from features.app_accounts import ensure_admin_account
+from features.repository import init_repository
+
+async def main():
+    await init_repository()
+    print((await ensure_admin_account()).account_id)
+
+asyncio.run(main())
+EOF
 ```
 
-After that the account is **closed** to self-registration — otherwise anyone
-knowing the ID could sign up as an admin — and further admins are made with
-the same script, which also covers an email that already has a user record in
-another application.
+It mints the admin account (idempotent — a second run prints the same ID)
+and prints its `account_id`. Put that in account-management-ui's `.env` as
+`VITE_ADMIN_ACCOUNT_ID`, then register the first administrator by signing up
+into it (`POST /auth/register` with that `account_id`). After that the account
+is **closed** to self-registration — otherwise anyone knowing the ID could
+sign up as an admin.
 
 
 ## Access model
 
 Two access levels, and nothing in between: any authenticated user, or an
-**administrator** — a user whose `account_id` is the configured admin app
-account (see [Administration](#administration)). An app account is the only
+**administrator** — a user whose account is admin-type
+(see [Administration](#administration)). An app account is the only
 thing a user belongs to, and it is what downstream services filter their data
 on. There is no separate platform-staff allowlist and no organization scope
 (see `features/dependencies.py`).
