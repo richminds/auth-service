@@ -1,12 +1,3 @@
 {
-  "$schema": "https://openapi.vercel.sh/vercel.json",
-  "env": {
-    "AUTHSVC_CORS_ORIGIN_REGEX": "^https://(account-management|knowledge-ingest-ui)[a-z0-9-]*\\.vercel\\.app$",
-    "AUTH_REFRESH_TTL_MINUTES": "10080",
-    "AUTH_PASSWORD_RESET_TTL_MINUTES": "30",
-    "AUTH_SMTP_PORT": "587",
-    "AUTH_SMTP_USE_TLS": "true",
-    "AUTH_SMTP_FROM_NAME": "RichMinds",
-    "AUTH_EXPOSE_RESET_TOKEN": "false"
-  }
+  "$schema": "https://openapi.vercel.sh/vercel.json"
 }
